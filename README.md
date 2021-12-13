@@ -10,3 +10,4 @@ A video player with high usability, no implicit telemetries
 * [ ] ASS Subtitle Support
 * [ ] Incognito Mode
 * [ ] DRM-Aware Playing
+* [ ] Multiple Codec Support
