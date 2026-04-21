@@ -1,0 +1,9 @@
+* text=auto eol=lf
+*.sln      text eol=crlf
+*.vcxproj  text eol=crlf
+*.rc       text eol=crlf
+*.manifest text eol=crlf
+
+*.png binary
+*.ico binary
+*.jpg binary

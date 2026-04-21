@@ -1,0 +1,39 @@
+#include <windows.h>
+
+// The #1 ID is CREATEPROCESS_MANIFEST_RESOURCE_ID; hard-coded to keep this
+// .rc buildable by rc.exe without pulling in winuser.h macros in exotic
+// preprocessor configurations.
+1 RT_MANIFEST "freikino.manifest"
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION    0,1,0,0
+ PRODUCTVERSION 0,1,0,0
+ FILEFLAGSMASK  0x3FL
+#ifdef _DEBUG
+ FILEFLAGS      0x1L
+#else
+ FILEFLAGS      0x0L
+#endif
+ FILEOS         0x40004L
+ FILETYPE       0x1L
+ FILESUBTYPE    0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName",      "Freikino"
+            VALUE "FileDescription",  "Freikino Video Player"
+            VALUE "FileVersion",      "0.1.0.0"
+            VALUE "InternalName",     "Freikino"
+            VALUE "LegalCopyright",   "Copyright (C) Freikino contributors"
+            VALUE "OriginalFilename", "Freikino.exe"
+            VALUE "ProductName",      "Freikino"
+            VALUE "ProductVersion",   "0.1.0.0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END

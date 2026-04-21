@@ -1,0 +1,26 @@
+build/
+out/
+.vs/
+.vscode/
+.idea/
+vcpkg_installed/
+CMakeUserPresets.json
+
+# Stray cmake configure at repo root (configure is meant to run in build/).
+/CMakeCache.txt
+/CMakeFiles/
+
+*.user
+*.suo
+*.aps
+*.pdb
+*.obj
+*.exe
+*.ilk
+*.lib
+*.dll
+*.exp
+*.tlog
+
+Thumbs.db
+Desktop.ini

@@ -1,0 +1,54 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": { "major": 3, "minor": 28, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "cacheVariables": {
+        "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
+        "VCPKG_TARGET_TRIPLET": "x64-windows"
+      }
+    },
+    {
+      "name": "vs2022-x64",
+      "inherits": "base",
+      "generator": "Visual Studio 17 2022",
+      "architecture": { "value": "x64", "strategy": "set" },
+      "toolset":      { "value": "host=x64", "strategy": "set" }
+    },
+    {
+      "name": "vs2022-x64-no-deps",
+      "displayName": "VS 2022 x64 (skeleton only, no FFmpeg/libass)",
+      "generator": "Visual Studio 17 2022",
+      "architecture": { "value": "x64", "strategy": "set" },
+      "toolset":      { "value": "host=x64", "strategy": "set" },
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "cacheVariables": {
+        "FREIKINO_WITH_MEDIA": "OFF"
+      }
+    },
+    {
+      "name": "ninja-debug",
+      "inherits": "base",
+      "generator": "Ninja",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug" },
+      "architecture": { "value": "x64", "strategy": "external" },
+      "toolset":      { "value": "host=x64", "strategy": "external" }
+    },
+    {
+      "name": "ninja-release",
+      "inherits": "ninja-debug",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" }
+    }
+  ],
+  "buildPresets": [
+    { "name": "vs2022-x64-debug",         "configurePreset": "vs2022-x64",         "configuration": "Debug" },
+    { "name": "vs2022-x64-release",       "configurePreset": "vs2022-x64",         "configuration": "Release" },
+    { "name": "vs2022-x64-no-deps-debug", "configurePreset": "vs2022-x64-no-deps", "configuration": "Debug" },
+    { "name": "vs2022-x64-no-deps-release","configurePreset": "vs2022-x64-no-deps","configuration": "Release" },
+    { "name": "ninja-debug",        "configurePreset": "ninja-debug" },
+    { "name": "ninja-release",      "configurePreset": "ninja-release" }
+  ]
+}

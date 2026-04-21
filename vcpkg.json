@@ -1,0 +1,28 @@
+{
+  "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
+  "name": "freikino",
+  "version-string": "0.1.0",
+  "description": "Freikino video player",
+  "homepage": "https://github.com/",
+  "dependencies": [
+    {
+      "name": "ffmpeg",
+      "default-features": false,
+      "features": [
+        "avcodec",
+        "avformat",
+        "avfilter",
+        "swresample",
+        "swscale",
+        "dav1d",
+        "opus",
+        "vorbis",
+        "opencl",
+        "nvcodec",
+        "amf",
+        "qsv"
+      ]
+    },
+    "libass"
+  ]
+}
