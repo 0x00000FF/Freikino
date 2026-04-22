@@ -1284,42 +1284,29 @@ void MainWindow::toggle_fullscreen() noexcept
 
 namespace {
 
-// Copy tightly-packed R8G8B8A8 (matches the swapchain's
-// DXGI_FORMAT_R8G8B8A8_UNORM back buffer) into a CF_DIB clipboard
-// payload, swapping R and B bytes on the way (CF_DIB with BI_RGB is
-// a BGRX/BGRA memory layout). Returns true only on full success;
-// the clipboard is left in its prior state on any failure.
-bool put_rgba_on_clipboard_as_bgrx(
-    HWND hwnd, const std::vector<std::uint8_t>& rgba,
-    UINT width, UINT height) noexcept
+// Allocate an HGLOBAL formatted as a DIB payload (BITMAPINFOHEADER +
+// pixel data) with R8G8B8A8 data repacked as BGR0 (high byte zeroed
+// per MSDN's BI_RGB 32-bpp "reserved" rule). The caller owns the
+// returned HGLOBAL and must either hand it to SetClipboardData (on
+// success the clipboard takes ownership) or GlobalFree it.
+HGLOBAL build_dib_hglobal(const std::vector<std::uint8_t>& rgba,
+                          UINT width, UINT height) noexcept
 {
-    if (width == 0 || height == 0) return false;
     const std::size_t pixel_bytes =
         static_cast<std::size_t>(width) * height * 4;
-    if (rgba.size() < pixel_bytes) return false;
-
-    if (!::OpenClipboard(hwnd)) return false;
-    ::EmptyClipboard();
+    if (rgba.size() < pixel_bytes) return nullptr;
 
     const std::size_t total = sizeof(BITMAPINFOHEADER) + pixel_bytes;
     HGLOBAL hg = ::GlobalAlloc(GMEM_MOVEABLE, total);
-    if (hg == nullptr) {
-        ::CloseClipboard();
-        return false;
-    }
+    if (hg == nullptr) return nullptr;
     void* mem = ::GlobalLock(hg);
-    if (mem == nullptr) {
-        ::GlobalFree(hg);
-        ::CloseClipboard();
-        return false;
-    }
+    if (mem == nullptr) { ::GlobalFree(hg); return nullptr; }
 
     auto* bih            = static_cast<BITMAPINFOHEADER*>(mem);
     bih->biSize          = sizeof(BITMAPINFOHEADER);
     bih->biWidth         = static_cast<LONG>(width);
-    // Negative height = top-down DIB, which matches the order we
-    // laid scanlines out in from the staging texture. Positive
-    // height would require reversing row order.
+    // Negative height = top-down DIB, matching the scanline order we
+    // copied out of the staging texture.
     bih->biHeight        = -static_cast<LONG>(height);
     bih->biPlanes        = 1;
     bih->biBitCount      = 32;
@@ -1336,44 +1323,137 @@ bool put_rgba_on_clipboard_as_bgrx(
         dst[i + 0] = src[i + 2]; // B
         dst[i + 1] = src[i + 1]; // G
         dst[i + 2] = src[i + 0]; // R
-        dst[i + 3] = src[i + 3]; // A (ignored by BI_RGB readers)
+        dst[i + 3] = 0x00;       // "reserved" for BI_RGB 32bpp
     }
     ::GlobalUnlock(hg);
+    return hg;
+}
 
-    if (!::SetClipboardData(CF_DIB, hg)) {
-        // Only free on failure — SetClipboardData took ownership
-        // when it returned a non-null handle.
-        ::GlobalFree(hg);
-        ::CloseClipboard();
+// Same payload shape but with a BITMAPV5HEADER and explicit bitfields
+// so modern consumers (browsers, Office, ShareX, etc.) that prefer
+// CF_DIBV5 pick it up with the correct channel ordering. Pixel
+// layout on disk is BGRA (little-endian DWORD 0xAARRGGBB).
+HGLOBAL build_dibv5_hglobal(const std::vector<std::uint8_t>& rgba,
+                            UINT width, UINT height) noexcept
+{
+    const std::size_t pixel_bytes =
+        static_cast<std::size_t>(width) * height * 4;
+    if (rgba.size() < pixel_bytes) return nullptr;
+
+    const std::size_t total = sizeof(BITMAPV5HEADER) + pixel_bytes;
+    HGLOBAL hg = ::GlobalAlloc(GMEM_MOVEABLE, total);
+    if (hg == nullptr) return nullptr;
+    void* mem = ::GlobalLock(hg);
+    if (mem == nullptr) { ::GlobalFree(hg); return nullptr; }
+
+    auto* h5              = static_cast<BITMAPV5HEADER*>(mem);
+    std::memset(h5, 0, sizeof(*h5));
+    h5->bV5Size           = sizeof(BITMAPV5HEADER);
+    h5->bV5Width          = static_cast<LONG>(width);
+    h5->bV5Height         = -static_cast<LONG>(height);
+    h5->bV5Planes         = 1;
+    h5->bV5BitCount       = 32;
+    h5->bV5Compression    = BI_BITFIELDS;
+    h5->bV5SizeImage      = static_cast<DWORD>(pixel_bytes);
+    h5->bV5RedMask        = 0x00FF0000;
+    h5->bV5GreenMask      = 0x0000FF00;
+    h5->bV5BlueMask       = 0x000000FF;
+    h5->bV5AlphaMask      = 0xFF000000;
+    h5->bV5CSType         = LCS_sRGB;
+    h5->bV5Intent         = LCS_GM_IMAGES;
+
+    auto* dst = static_cast<std::uint8_t*>(mem) + sizeof(BITMAPV5HEADER);
+    const auto* src = rgba.data();
+    for (std::size_t i = 0; i < pixel_bytes; i += 4) {
+        dst[i + 0] = src[i + 2]; // B
+        dst[i + 1] = src[i + 1]; // G
+        dst[i + 2] = src[i + 0]; // R
+        dst[i + 3] = src[i + 3]; // A
+    }
+    ::GlobalUnlock(hg);
+    return hg;
+}
+
+// Publish both CF_DIB and CF_DIBV5. Some legacy apps only consume
+// CF_DIB; newer ones (browsers, Paint.NET, ShareX) prefer CF_DIBV5
+// with alpha + colourspace. Writing both avoids picking winners.
+bool put_rgba_on_clipboard_as_bgrx(
+    HWND hwnd, const std::vector<std::uint8_t>& rgba,
+    UINT width, UINT height) noexcept
+{
+    if (width == 0 || height == 0) return false;
+
+    if (!::OpenClipboard(hwnd)) {
+        log::warn("clipboard: OpenClipboard failed, last error={}",
+                  ::GetLastError());
         return false;
     }
+    ::EmptyClipboard();
+
+    bool any_set = false;
+
+    HGLOBAL hg_v5 = build_dibv5_hglobal(rgba, width, height);
+    if (hg_v5 != nullptr) {
+        if (::SetClipboardData(CF_DIBV5, hg_v5) != nullptr) {
+            any_set = true;
+        } else {
+            log::warn("clipboard: SetClipboardData(CF_DIBV5) failed le={}",
+                      ::GetLastError());
+            ::GlobalFree(hg_v5);
+        }
+    } else {
+        log::warn("clipboard: build_dibv5_hglobal returned null");
+    }
+
+    HGLOBAL hg_dib = build_dib_hglobal(rgba, width, height);
+    if (hg_dib != nullptr) {
+        if (::SetClipboardData(CF_DIB, hg_dib) != nullptr) {
+            any_set = true;
+        } else {
+            log::warn("clipboard: SetClipboardData(CF_DIB) failed le={}",
+                      ::GetLastError());
+            ::GlobalFree(hg_dib);
+        }
+    } else {
+        log::warn("clipboard: build_dib_hglobal returned null");
+    }
+
     ::CloseClipboard();
-    return true;
+    return any_set;
 }
 
 } // namespace
 
 void MainWindow::copy_scene_to_clipboard(bool with_subtitles) noexcept
 {
+    log::info("clipboard: copy requested (subs={})",
+              with_subtitles ? 1 : 0);
     if (!presenter_created_) {
+        log::warn("clipboard: presenter not ready, aborting");
         return;
     }
     capture_mode_ = with_subtitles
         ? CaptureMode::SceneWithSubtitles
         : CaptureMode::Scene;
 
-    std::vector<std::uint8_t> bgra;
+    std::vector<std::uint8_t> rgba;
     UINT cap_w = 0;
     UINT cap_h = 0;
-    const bool ok = presenter_.capture_back_buffer(bgra, cap_w, cap_h);
+    const bool ok = presenter_.capture_back_buffer(rgba, cap_w, cap_h);
     capture_mode_ = CaptureMode::None;
 
-    if (!ok || bgra.empty() || cap_w == 0 || cap_h == 0) {
-        log::warn("clipboard: scene capture failed");
+    if (!ok || rgba.empty() || cap_w == 0 || cap_h == 0) {
+        log::warn(
+            "clipboard: scene capture failed (ok={} bytes={} {}x{})",
+            ok ? 1 : 0, rgba.size(), cap_w, cap_h);
         return;
     }
-    if (!put_rgba_on_clipboard_as_bgrx(handle(), bgra, cap_w, cap_h)) {
-        log::warn("clipboard: SetClipboardData failed");
+    log::info(
+        "clipboard: captured {}x{} ({} bytes), writing to clipboard",
+        cap_w, cap_h, rgba.size());
+    if (!put_rgba_on_clipboard_as_bgrx(handle(), rgba, cap_w, cap_h)) {
+        log::warn("clipboard: SetClipboardData failed, last error={}",
+                  ::GetLastError());
         return;
     }
     log::info(
