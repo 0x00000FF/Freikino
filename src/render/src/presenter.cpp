@@ -4,6 +4,7 @@
 #include "freikino/common/log.h"
 
 #include <cstdint>
+#include <cstring>
 
 #include <windows.h>
 
@@ -154,7 +155,106 @@ void Presenter::render()
         }
     }
 
+    // Copy the back buffer into a CPU-readable staging texture
+    // BEFORE Present. Flip-model swapchains leave back-buffer
+    // contents undefined after Present, so the snapshot has to
+    // happen now while the frame we just composed is still intact.
+    if (capture_pending_) {
+        ID3D11Texture2D* back = swap_.back();
+        if (back != nullptr) {
+            D3D11_TEXTURE2D_DESC back_desc{};
+            back->GetDesc(&back_desc);
+
+            bool rebuild = !capture_staging_;
+            if (!rebuild) {
+                D3D11_TEXTURE2D_DESC sd{};
+                capture_staging_->GetDesc(&sd);
+                if (sd.Width != back_desc.Width
+                    || sd.Height != back_desc.Height
+                    || sd.Format != back_desc.Format) {
+                    rebuild = true;
+                }
+            }
+            if (rebuild) {
+                D3D11_TEXTURE2D_DESC sd     = back_desc;
+                sd.Usage                    = D3D11_USAGE_STAGING;
+                sd.BindFlags                = 0;
+                sd.CPUAccessFlags           = D3D11_CPU_ACCESS_READ;
+                sd.MiscFlags                = 0;
+                sd.SampleDesc.Count         = 1;
+                sd.SampleDesc.Quality       = 0;
+                capture_staging_.Reset();
+                const HRESULT hr = device_.d3d()->CreateTexture2D(
+                    &sd, nullptr, &capture_staging_);
+                if (FAILED(hr)) {
+                    log::warn("capture: staging create failed 0x{:08X}",
+                              static_cast<unsigned>(hr));
+                    capture_staging_.Reset();
+                }
+            }
+            if (capture_staging_) {
+                device_.context()->CopyResource(
+                    capture_staging_.Get(), back);
+            }
+        }
+    }
+
     swap_.present(/* vsync */ true);
+}
+
+bool Presenter::capture_back_buffer(
+    std::vector<std::uint8_t>& bgra_out,
+    UINT& width_out, UINT& height_out)
+{
+    bgra_out.clear();
+    width_out  = 0;
+    height_out = 0;
+
+    if (!ready()) {
+        return false;
+    }
+
+    capture_pending_ = true;
+    try {
+        render();
+    } catch (...) {
+        capture_pending_ = false;
+        return false;
+    }
+    capture_pending_ = false;
+
+    if (!capture_staging_) {
+        return false;
+    }
+
+    D3D11_TEXTURE2D_DESC desc{};
+    capture_staging_->GetDesc(&desc);
+
+    D3D11_MAPPED_SUBRESOURCE mapped{};
+    const HRESULT hr = device_.context()->Map(
+        capture_staging_.Get(), 0, D3D11_MAP_READ, 0, &mapped);
+    if (FAILED(hr)) {
+        log::warn("capture: staging Map failed 0x{:08X}",
+                  static_cast<unsigned>(hr));
+        return false;
+    }
+
+    width_out  = desc.Width;
+    height_out = desc.Height;
+    const std::size_t row_bytes =
+        static_cast<std::size_t>(desc.Width) * 4;
+    bgra_out.resize(row_bytes * desc.Height);
+
+    const auto* src = static_cast<const std::uint8_t*>(mapped.pData);
+    std::uint8_t* dst = bgra_out.data();
+    for (UINT y = 0; y < desc.Height; ++y) {
+        std::memcpy(dst, src, row_bytes);
+        dst += row_bytes;
+        src += mapped.RowPitch;
+    }
+
+    device_.context()->Unmap(capture_staging_.Get(), 0);
+    return true;
 }
 
 } // namespace freikino::render

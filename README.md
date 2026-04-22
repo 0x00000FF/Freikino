@@ -55,6 +55,12 @@ you're watching to the rest of your system. Relevant concretely:
 | `P`    | Toggle incognito mode                      |
 | `F3`   | Toggle debug overlay (FPS / queues / etc.) |
 
+### Clipboard
+| Key            | Action                                                |
+| -------------- | ----------------------------------------------------- |
+| `Ctrl`+`C`       | Copy the current scene to the clipboard (no subtitles, no transport / playlist / toasts) |
+| `Ctrl`+`Shift`+`C` | Same, but with any active subtitle tracks included |
+
 ### Audio track picker (with panel open)
 | Key         | Action                                                  |
 | ----------- | ------------------------------------------------------- |

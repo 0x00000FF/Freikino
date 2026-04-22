@@ -137,6 +137,14 @@ private:
     static void playlist_play_request(void* user, std::size_t index) noexcept;
     void play_playlist_index(std::size_t index) noexcept;
 
+    // Ctrl+C / Ctrl+Shift+C handler: snapshot the current frame
+    // (without / with subtitles) to the Windows clipboard as a
+    // CF_DIB bitmap. Flips `capture_mode_` around a synchronous
+    // render so the overlay callback skips UI chrome (transport,
+    // playlist, toasts, debug overlay, …) and — in the subtitles
+    // case — keeps the subtitle overlay on.
+    void copy_scene_to_clipboard(bool with_subtitles) noexcept;
+
     // Pop the top-of-screen toast with the playback transition label
     // ("Playing" / "Paused" / "Stopped"), appending "(Subtitled)" if
     // a subtitle track is currently loaded.
@@ -181,6 +189,18 @@ private:
     bool                     presenter_created_ = false;
     bool                     overlay_created_   = false;
     bool                     mouse_tracked_     = false;
+
+    // Clipboard-capture mode. Consulted by the overlay callback so
+    // the snapshot Ctrl+C / Ctrl+Shift+C produces contains just the
+    // video (and optionally the subtitles) — no transport bar,
+    // playlist, toasts, or debug HUD. Set only from the UI thread
+    // around a single render pass inside `copy_scene_to_clipboard`.
+    enum class CaptureMode {
+        None,
+        Scene,                 // video + spectrum + audio-info only
+        SceneWithSubtitles,    // the above plus active subtitle tracks
+    };
+    CaptureMode              capture_mode_      = CaptureMode::None;
 
     // Fullscreen state. When `fs_active_` is true we've swapped the
     // window style to borderless-monitor-sized and stashed the previous

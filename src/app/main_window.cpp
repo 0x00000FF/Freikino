@@ -154,17 +154,22 @@ void MainWindow::create(HINSTANCE instance)
         presenter_.set_overlay_callback(
             [this](UINT w, UINT h) {
                 ID2D1DeviceContext* ctx = overlay_renderer_.begin_draw();
-                if (ctx != nullptr) {
-                    // Subtitles paint first — they're part of the
-                    // video content layer — so chrome (playlist,
-                    // transport, toasts) sits on top without being
-                    // obscured by a caption.
-                    // Audio-only path draws first: spectrum (full-
-                    // area backdrop) then the info card on top of
-                    // it. No-ops when a video file is playing.
-                    spectrum_.draw(ctx, w, h);
-                    audio_info_overlay_.draw(ctx, w, h);
+                if (ctx == nullptr) return;
+
+                const CaptureMode cm = capture_mode_;
+                // Content overlays (always part of the "scene" for
+                // clipboard capture): audio-visualiser backdrop, the
+                // info card on top of it (both no-ops during video
+                // playback), and any active subtitle tracks.
+                spectrum_.draw(ctx, w, h);
+                audio_info_overlay_.draw(ctx, w, h);
+                if (cm != CaptureMode::Scene) {
                     subtitle_overlay_.draw(ctx, w, h);
+                }
+                // Chrome / transient UI — skipped while capturing so
+                // the clipboard image is a clean scene, not a
+                // screenshot of the whole player.
+                if (cm == CaptureMode::None) {
                     playlist_overlay_.draw(ctx, w, h);
                     title_toast_.draw(ctx, w, h);
                     volume_osd_.draw(ctx, w, h);
@@ -177,8 +182,8 @@ void MainWindow::create(HINSTANCE instance)
                     subtitle_setup_overlay_.draw(ctx, w, h);
                     audio_tracks_overlay_.draw(ctx, w, h);
                     debug_overlay_.draw(ctx, w, h);
-                    overlay_renderer_.end_draw();
                 }
+                overlay_renderer_.end_draw();
             });
     } catch (const hresult_error& e) {
         // Non-fatal: the player still works without the transport bar.
@@ -689,6 +694,15 @@ void MainWindow::on_keydown(WPARAM vk, bool repeat) noexcept
             if (!repeat) {
                 audio_tracks_overlay_.toggle_visible();
                 transport_overlay_.bump_activity();
+            }
+            break;
+        case 'C':
+            // Ctrl+C: copy the current scene (video + audio-visualiser
+            // + info card) to the clipboard. Ctrl+Shift+C additionally
+            // includes any active subtitle overlays. A plain `C`
+            // without modifiers falls through to the default branch.
+            if (ctrl && !repeat) {
+                copy_scene_to_clipboard(shift);
             }
             break;
         case VK_OEM_COMMA:
@@ -1266,6 +1280,108 @@ void MainWindow::toggle_fullscreen() noexcept
     }
 
     transport_overlay_.bump_activity();
+}
+
+namespace {
+
+// Copy tightly-packed R8G8B8A8 (matches the swapchain's
+// DXGI_FORMAT_R8G8B8A8_UNORM back buffer) into a CF_DIB clipboard
+// payload, swapping R and B bytes on the way (CF_DIB with BI_RGB is
+// a BGRX/BGRA memory layout). Returns true only on full success;
+// the clipboard is left in its prior state on any failure.
+bool put_rgba_on_clipboard_as_bgrx(
+    HWND hwnd, const std::vector<std::uint8_t>& rgba,
+    UINT width, UINT height) noexcept
+{
+    if (width == 0 || height == 0) return false;
+    const std::size_t pixel_bytes =
+        static_cast<std::size_t>(width) * height * 4;
+    if (rgba.size() < pixel_bytes) return false;
+
+    if (!::OpenClipboard(hwnd)) return false;
+    ::EmptyClipboard();
+
+    const std::size_t total = sizeof(BITMAPINFOHEADER) + pixel_bytes;
+    HGLOBAL hg = ::GlobalAlloc(GMEM_MOVEABLE, total);
+    if (hg == nullptr) {
+        ::CloseClipboard();
+        return false;
+    }
+    void* mem = ::GlobalLock(hg);
+    if (mem == nullptr) {
+        ::GlobalFree(hg);
+        ::CloseClipboard();
+        return false;
+    }
+
+    auto* bih            = static_cast<BITMAPINFOHEADER*>(mem);
+    bih->biSize          = sizeof(BITMAPINFOHEADER);
+    bih->biWidth         = static_cast<LONG>(width);
+    // Negative height = top-down DIB, which matches the order we
+    // laid scanlines out in from the staging texture. Positive
+    // height would require reversing row order.
+    bih->biHeight        = -static_cast<LONG>(height);
+    bih->biPlanes        = 1;
+    bih->biBitCount      = 32;
+    bih->biCompression   = BI_RGB;
+    bih->biSizeImage     = static_cast<DWORD>(pixel_bytes);
+    bih->biXPelsPerMeter = 0;
+    bih->biYPelsPerMeter = 0;
+    bih->biClrUsed       = 0;
+    bih->biClrImportant  = 0;
+
+    auto* dst = static_cast<std::uint8_t*>(mem) + sizeof(BITMAPINFOHEADER);
+    const auto* src = rgba.data();
+    for (std::size_t i = 0; i < pixel_bytes; i += 4) {
+        dst[i + 0] = src[i + 2]; // B
+        dst[i + 1] = src[i + 1]; // G
+        dst[i + 2] = src[i + 0]; // R
+        dst[i + 3] = src[i + 3]; // A (ignored by BI_RGB readers)
+    }
+    ::GlobalUnlock(hg);
+
+    if (!::SetClipboardData(CF_DIB, hg)) {
+        // Only free on failure — SetClipboardData took ownership
+        // when it returned a non-null handle.
+        ::GlobalFree(hg);
+        ::CloseClipboard();
+        return false;
+    }
+    ::CloseClipboard();
+    return true;
+}
+
+} // namespace
+
+void MainWindow::copy_scene_to_clipboard(bool with_subtitles) noexcept
+{
+    if (!presenter_created_) {
+        return;
+    }
+    capture_mode_ = with_subtitles
+        ? CaptureMode::SceneWithSubtitles
+        : CaptureMode::Scene;
+
+    std::vector<std::uint8_t> bgra;
+    UINT cap_w = 0;
+    UINT cap_h = 0;
+    const bool ok = presenter_.capture_back_buffer(bgra, cap_w, cap_h);
+    capture_mode_ = CaptureMode::None;
+
+    if (!ok || bgra.empty() || cap_w == 0 || cap_h == 0) {
+        log::warn("clipboard: scene capture failed");
+        return;
+    }
+    if (!put_rgba_on_clipboard_as_bgrx(handle(), bgra, cap_w, cap_h)) {
+        log::warn("clipboard: SetClipboardData failed");
+        return;
+    }
+    log::info(
+        "clipboard: scene copied ({}x{}, subtitles={})",
+        cap_w, cap_h, with_subtitles ? 1 : 0);
+    title_toast_.show(
+        with_subtitles ? L"Scene copied (with subtitles)"
+                       : L"Scene copied");
 }
 
 void MainWindow::apply_window_chrome() noexcept

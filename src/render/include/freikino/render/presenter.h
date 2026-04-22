@@ -10,6 +10,7 @@
 #include <atomic>
 #include <cstdint>
 #include <functional>
+#include <vector>
 
 #include <windows.h>
 
@@ -70,6 +71,23 @@ public:
     HANDLE wait_object() const noexcept { return swap_.waitable(); }
     bool   ready()       const noexcept { return swap_.rtv() != nullptr; }
 
+    // Render one frame synchronously and snapshot the back buffer
+    // into `bgra_out` as tightly-packed BGRA scanlines (top-down,
+    // width*4 bytes per row). Returns false if the presenter isn't
+    // ready, the render pipeline threw, or the staging map failed.
+    //
+    // Runs the normal render path, so whatever the overlay callback
+    // currently paints ends up in the capture — callers that want a
+    // specific subset of overlays (e.g. "video only" or
+    // "video + subtitles") should flip their own mode flag around the
+    // call so the callback skips the overlays they don't want.
+    //
+    // Must be called on the render (UI) thread. Synchronous — blocks
+    // on GPU copy + CPU readback (typically 10-30 ms at 1080p).
+    bool capture_back_buffer(std::vector<std::uint8_t>& bgra_out,
+                             UINT& width_out,
+                             UINT& height_out);
+
     // Cumulative number of times a fresh video frame has been promoted
     // onto the pipeline (i.e. real visible frames on screen). Sampled
     // by the debug overlay to compute the playback frame rate — which
@@ -105,6 +123,18 @@ private:
     // only; atomic so external samplers (debug overlay) get a
     // consistent read without locking.
     std::atomic<std::uint64_t> displayed_frames_{0};
+
+    // Set by `capture_back_buffer` before the synchronous render()
+    // call it issues; read inside render() just before Present so we
+    // can copy the back buffer into `capture_staging_` while the
+    // frame's contents are still intact. (Flip-model swapchains
+    // leave back-buffer contents undefined after Present, so the
+    // copy has to happen beforehand.)
+    bool                       capture_pending_ = false;
+    // CPU-readable texture used as the CopyResource destination. Size
+    // + format are validated on every capture and the texture is
+    // rebuilt when the swap-chain geometry changes.
+    ComPtr<ID3D11Texture2D>    capture_staging_;
 };
 
 } // namespace freikino::render
