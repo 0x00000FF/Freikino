@@ -516,6 +516,16 @@ bool TransportOverlay::hit_interactive(
     return false;
 }
 
+bool TransportOverlay::hit_volume_popup(
+    int x, int y, UINT w, UINT h) const noexcept
+{
+    if (!hover_volume_ && !volume_dragging_) {
+        return false;
+    }
+    const Layout l = compute_layout(w, h);
+    return hit(l.volume_popup_hit, x, y);
+}
+
 void TransportOverlay::on_mouse_leave() noexcept
 {
     // Don't drop drag state on mouse-leave — SetCapture keeps tracking even

@@ -1177,6 +1177,18 @@ LRESULT MainWindow::on_nchittest(LPARAM lparam) noexcept
             static_cast<UINT>(rc.bottom))) {
         return HTCLIENT;
     }
+    // Volume popup floats above the transport bar (in the otherwise
+    // caption/drag zone) while hovering the speaker. Must stay
+    // HTCLIENT while open — otherwise the cursor crosses the
+    // bar-top boundary on the way to the slider, that triggers
+    // WM_MOUSELEAVE on the client area, hover_volume_ gets cleared,
+    // and the popup collapses before the user can adjust it.
+    if (transport_overlay_.hit_volume_popup(
+            pt.x, pt.y,
+            static_cast<UINT>(rc.right),
+            static_cast<UINT>(rc.bottom))) {
+        return HTCLIENT;
+    }
     if (pt.y < rc.bottom - kTransportBarHeightPx) {
         return HTCAPTION;
     }

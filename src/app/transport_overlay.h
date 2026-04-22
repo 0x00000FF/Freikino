@@ -79,6 +79,15 @@ public:
     [[nodiscard]] bool hit_interactive(int x, int y,
                                        UINT width, UINT height) const noexcept;
 
+    // True when the volume popup is currently displayed (hover or
+    // drag) AND the given client-area point falls inside the popup's
+    // hit region. Needed by MainWindow's WM_NCHITTEST so the popup
+    // stays in HTCLIENT — otherwise the slider would land in the
+    // drag-to-move caption zone, generating WM_MOUSELEAVE as the
+    // cursor crosses the bar-top boundary and collapsing the popup.
+    [[nodiscard]] bool hit_volume_popup(int x, int y,
+                                        UINT width, UINT height) const noexcept;
+
     // Public hook so the message window can keep the bar visible on
     // non-mouse activity (volume keys, pause toggle, etc.).
     void bump_activity() noexcept { last_activity_ms_ = ::GetTickCount64(); }
