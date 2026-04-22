@@ -926,6 +926,7 @@ struct SubtitleSource::State {
     ASS_Library*        library = nullptr;
     ASS_Track*          track   = nullptr;
     std::atomic_int64_t delay_ns{0};
+    std::wstring        label;
 
     ~State()
     {
@@ -1056,7 +1057,50 @@ bool SubtitleSource::open(
 
     log::info("subtitle: loaded {} ({}, {}, {} events)",
               wide_to_utf8(path), fmt_name, enc, s_->track->n_events);
+
+    // Label: basename without the directory.
+    const auto slash = path.find_last_of(L"\\/");
+    s_->label = (slash == std::wstring::npos) ? path : path.substr(slash + 1);
     return true;
+}
+
+bool SubtitleSource::open_from_memory(
+    std::string ass_bytes, std::wstring display_label) noexcept
+{
+    if (s_->track != nullptr) {
+        ass_free_track(s_->track);
+        s_->track = nullptr;
+    }
+    if (s_->library == nullptr) {
+        s_->library = ass_library_init();
+        if (s_->library == nullptr) {
+            log::error("subtitle: ass_library_init failed");
+            return false;
+        }
+    }
+    if (ass_bytes.empty()) {
+        return false;
+    }
+
+    s_->track = ass_read_memory(
+        s_->library,
+        ass_bytes.data(),
+        ass_bytes.size(),
+        nullptr /* bytes already UTF-8 */);
+    if (s_->track == nullptr) {
+        log::error("subtitle: ass_read_memory (embedded) failed");
+        return false;
+    }
+    s_->label = std::move(display_label);
+    log::info("subtitle: loaded embedded {} ({} events)",
+              wide_to_utf8(s_->label), s_->track->n_events);
+    return true;
+}
+
+const std::wstring& SubtitleSource::label() const noexcept
+{
+    static const std::wstring kEmpty;
+    return s_ != nullptr ? s_->label : kEmpty;
 }
 
 bool SubtitleSource::loaded() const noexcept

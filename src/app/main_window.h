@@ -64,11 +64,14 @@ public:
 
     // Wire the media source so the debug overlay can show queue
     // depths and decoder push rates. Also feeds the audio-tracks
-    // overlay so the list reflects the currently-loaded file.
+    // overlay (so the list reflects the currently-loaded file) and
+    // the subtitle overlay (so embedded subtitle streams show up in
+    // the S-panel track list).
     void set_debug_source(media::FFmpegSource* source) noexcept
     {
         debug_overlay_.set_media_source(source);
         audio_tracks_overlay_.set_source(source);
+        subtitle_overlay_.set_source(source);
     }
 
     // Hook up the shared playlist + session opener. MediaSession is

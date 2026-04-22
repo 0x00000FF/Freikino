@@ -141,6 +141,32 @@ public:
     // Stream index of the currently-active audio track, or -1 if none.
     [[nodiscard]] int active_audio_stream_index() const noexcept;
 
+    // One entry per subtitle stream in the container. Enumerated at
+    // open() time; embedded subtitles are extracted to ASS text on
+    // demand via `extract_subtitle_ass` so the initial open stays
+    // fast. `is_text` means the codec is text-based (ASS/SSA/SRT and
+    // friends) and therefore extractable — image-based formats
+    // (PGS, DVD VOBSUB) are listed but flagged so the UI can grey
+    // them out.
+    struct SubtitleTrack {
+        int         stream_index   = -1;
+        std::string codec_name;
+        std::string language;
+        std::string title;
+        bool        is_default     = false;
+        bool        is_text        = false;
+    };
+    [[nodiscard]] std::vector<SubtitleTrack> subtitle_tracks() const noexcept;
+
+    // Pull the full dialogue history of a subtitle stream and return
+    // it as a self-contained ASS document (Script Info + V4+ Styles +
+    // Events). Opens a secondary AVFormatContext on the same file so
+    // the live playback demuxer isn't disturbed. Returns an empty
+    // string on failure (codec not decodable, stream not subtitle,
+    // I/O error). Runs synchronously on the caller's thread; typical
+    // cost is tens of milliseconds per track.
+    [[nodiscard]] std::string extract_subtitle_ass(int stream_index) const noexcept;
+
     // Live metrics for the debug overlay.
     [[nodiscard]] std::size_t   video_queue_depth() const noexcept
     {

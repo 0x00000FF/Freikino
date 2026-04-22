@@ -42,6 +42,20 @@ public:
     bool open(const std::wstring& path,
               const std::string& forced_encoding = {});
 
+    // Load an already-prepared ASS document from memory. Used for
+    // embedded subtitle tracks: FFmpegSource::extract_subtitle_ass
+    // returns the full Script-Info + Styles + Events document, and
+    // this feeds it straight to libass without another round of
+    // encoding detection. `display_label` is kept for the UI and
+    // accessed via `label()`. Previously-loaded content is discarded.
+    bool open_from_memory(std::string ass_bytes,
+                          std::wstring display_label) noexcept;
+
+    // Optional user-facing label associated with this source (set by
+    // `open()` to the path's basename, by `open_from_memory` to the
+    // caller-provided label). Empty if never opened.
+    [[nodiscard]] const std::wstring& label() const noexcept;
+
     [[nodiscard]] bool       loaded() const noexcept;
     [[nodiscard]] ASS_Track* track()  const noexcept;
     [[nodiscard]] ASS_Library* library() const noexcept;

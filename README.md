@@ -78,15 +78,22 @@ caption.
 
 With the subtitle setup panel open (`S`):
 
-| Key     | Action                                                      |
-| ------- | ----------------------------------------------------------- |
-| `,`     | Subtitle delay −100 ms                                      |
-| `.`     | Subtitle delay +100 ms                                      |
-| `0`     | Reset subtitle delay                                        |
-| `-`     | Shrink subtitle font                                        |
-| `=`     | Grow subtitle font                                          |
-| `E`     | Cycle forced encoding (auto → UTF-8 → UTF-16LE/BE → CP949/932/936/1252) |
-| `F`     | Pick a subtitle font (system font dialog; useful for CJK)   |
+| Key         | Action                                                      |
+| ----------- | ----------------------------------------------------------- |
+| `↑` / `↓`   | Move highlight through the track list                       |
+| `Space`     | Toggle the highlighted track on / off (tracks stack — several can render at once) |
+| `,`         | Subtitle delay −100 ms                                      |
+| `.`         | Subtitle delay +100 ms                                      |
+| `0`         | Reset subtitle delay                                        |
+| `-`         | Shrink subtitle font                                        |
+| `=`         | Grow subtitle font                                          |
+| `E`         | Cycle forced encoding (auto → UTF-8 → UTF-16LE/BE → CP949/932/936/1252) |
+| `F`         | Pick a subtitle font (system font dialog; useful for CJK)   |
+
+The panel lists the external subtitle file (if one was dropped or auto-
+loaded) plus every embedded subtitle stream in the container. Image-
+based subs (PGS / VOBSUB) are listed but disabled — only text-based
+tracks can currently be rendered.
 
 ## Goals
 

@@ -2,6 +2,7 @@
 
 #include "freikino/common/com.h"
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
 
@@ -40,9 +41,18 @@ public:
         subtitles_ = ov;
     }
 
-    void toggle_visible() noexcept { visible_ = !visible_; }
+    void toggle_visible() noexcept;
     [[nodiscard]] bool visible() const noexcept { return visible_; }
     void hide() noexcept { visible_ = false; }
+
+    // Move the highlight through the track list. Wraps at the ends.
+    // No-op if the list has fewer than two rows.
+    void move_highlight(int delta) noexcept;
+
+    // Flip the active state of the currently-highlighted track. For
+    // embedded tracks this triggers on-demand extraction the first
+    // time the track is activated.
+    void toggle_highlighted() noexcept;
 
     void draw(ID2D1DeviceContext* ctx, UINT width, UINT height) noexcept;
 
@@ -50,14 +60,22 @@ private:
     SubtitleOverlay* subtitles_ = nullptr;
     bool             visible_   = false;
 
+    // Index into the track list fetched from SubtitleOverlay.
+    // Clamped at `draw` time in case the list shrinks while the
+    // panel is open.
+    std::size_t      highlight_row_ = 0;
+
     ComPtr<ID2D1SolidColorBrush> brush_bg_;
     ComPtr<ID2D1SolidColorBrush> brush_accent_;
     ComPtr<ID2D1SolidColorBrush> brush_text_;
     ComPtr<ID2D1SolidColorBrush> brush_muted_;
+    ComPtr<ID2D1SolidColorBrush> brush_row_active_;
+    ComPtr<ID2D1SolidColorBrush> brush_row_highlight_;
     ComPtr<IDWriteTextFormat>    text_title_;
     ComPtr<IDWriteTextFormat>    text_label_;
     ComPtr<IDWriteTextFormat>    text_value_;
     ComPtr<IDWriteTextFormat>    text_hint_;
+    ComPtr<IDWriteTextFormat>    text_row_;
 };
 
 } // namespace freikino::app

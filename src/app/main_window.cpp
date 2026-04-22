@@ -501,10 +501,16 @@ void MainWindow::on_size(UINT width, UINT height) noexcept
 void MainWindow::on_keydown(WPARAM vk, bool repeat) noexcept
 {
     if (vk == VK_ESCAPE) {
-        // Escape closes the audio-tracks picker first (so it can act
-        // like a modal panel). Otherwise: exit fullscreen, then close.
+        // Escape closes any open modal-ish overlay first. Order of
+        // precedence: audio picker, then subtitle setup panel. After
+        // that, exit fullscreen or close the window.
         if (audio_tracks_overlay_.visible()) {
             audio_tracks_overlay_.hide();
+            transport_overlay_.bump_activity();
+            return;
+        }
+        if (subtitle_setup_overlay_.visible()) {
+            subtitle_setup_overlay_.hide();
             transport_overlay_.bump_activity();
             return;
         }
@@ -514,6 +520,31 @@ void MainWindow::on_keydown(WPARAM vk, bool repeat) noexcept
             ::PostMessageW(handle(), WM_CLOSE, 0, 0);
         }
         return;
+    }
+
+    // Subtitle setup panel captures Up/Down (track highlight) and
+    // Space (toggle highlighted track) while it's open. Other keys
+    // (the delay / font-size / encoding shortcuts further down) still
+    // fall through to the general handler so their existing panel-
+    // open gates keep working.
+    if (subtitle_setup_overlay_.visible()) {
+        if (vk == VK_UP) {
+            subtitle_setup_overlay_.move_highlight(-1);
+            transport_overlay_.bump_activity();
+            return;
+        }
+        if (vk == VK_DOWN) {
+            subtitle_setup_overlay_.move_highlight(+1);
+            transport_overlay_.bump_activity();
+            return;
+        }
+        if (vk == VK_SPACE) {
+            if (!repeat) {
+                subtitle_setup_overlay_.toggle_highlighted();
+                transport_overlay_.bump_activity();
+            }
+            return;
+        }
     }
 
     // Audio-tracks picker captures navigation keys while open — Up/Down

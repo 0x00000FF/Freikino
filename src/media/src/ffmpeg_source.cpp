@@ -168,7 +168,12 @@ struct FFmpegSource::State {
     int64_t                     audio_bit_rate        = 0;
     FFmpegSource::Metadata      metadata;
     FFmpegSource::AlbumArt      album_art;
-    std::vector<FFmpegSource::AudioTrack> audio_tracks;
+    std::vector<FFmpegSource::AudioTrack>    audio_tracks;
+    std::vector<FFmpegSource::SubtitleTrack> subtitle_tracks;
+    // UTF-8 path retained so `extract_subtitle_ass` can open a
+    // secondary AVFormatContext without having to thread the wide
+    // path through.
+    std::string                 source_path_utf8;
 
     // Lower bound (with margin) for which frames to push after a seek.
     // `avformat_seek_file` with AVSEEK_FLAG_BACKWARD lands at the
@@ -345,6 +350,7 @@ void FFmpegSource::open(const std::wstring& path)
     }
 
     const std::string utf8_path = wide_to_utf8(path);
+    s_->source_path_utf8 = utf8_path;
 
     AVFormatContext* raw_fmt = nullptr;
     check_av(avformat_open_input(&raw_fmt, utf8_path.c_str(), nullptr, nullptr));
@@ -469,6 +475,35 @@ void FFmpegSource::open(const std::wstring& path)
         t.sample_rate = st->codecpar->sample_rate;
         t.is_default  = (st->disposition & AV_DISPOSITION_DEFAULT) != 0;
         s_->audio_tracks.push_back(std::move(t));
+    }
+
+    // ---- Enumerate subtitle tracks ----
+    // Metadata-only here; the actual ASS document for each stream is
+    // built lazily by `extract_subtitle_ass` once the user opts the
+    // track in from the setup overlay. is_text flags codecs that
+    // produce text events libass can consume (ASS/SSA/SRT/MovText);
+    // image-based subs (PGS, VOBSUB) are listed for completeness but
+    // the UI disables them.
+    for (unsigned i = 0; i < s_->fmt->nb_streams; ++i) {
+        AVStream* st = s_->fmt->streams[i];
+        if (st->codecpar->codec_type != AVMEDIA_TYPE_SUBTITLE) {
+            continue;
+        }
+        SubtitleTrack t;
+        t.stream_index = static_cast<int>(i);
+        const AVCodec* d =
+            avcodec_find_decoder(st->codecpar->codec_id);
+        if (d != nullptr && d->name != nullptr) {
+            t.codec_name = d->name;
+        }
+        t.language   = read_str_tag(st->metadata, "language");
+        t.title      = read_str_tag(st->metadata, "title");
+        t.is_default = (st->disposition & AV_DISPOSITION_DEFAULT) != 0;
+        const AVCodecDescriptor* desc =
+            avcodec_descriptor_get(st->codecpar->codec_id);
+        t.is_text = (desc != nullptr)
+                  && (desc->props & AV_CODEC_PROP_TEXT_SUB) != 0;
+        s_->subtitle_tracks.push_back(std::move(t));
     }
 
     // ---- Audio stream ----
@@ -707,6 +742,161 @@ std::vector<FFmpegSource::AudioTrack> FFmpegSource::audio_tracks() const noexcep
 int FFmpegSource::active_audio_stream_index() const noexcept
 {
     return s_ ? s_->audio_stream_index : -1;
+}
+
+std::vector<FFmpegSource::SubtitleTrack>
+FFmpegSource::subtitle_tracks() const noexcept
+{
+    return s_ ? s_->subtitle_tracks : std::vector<SubtitleTrack>{};
+}
+
+std::string FFmpegSource::extract_subtitle_ass(int stream_index) const noexcept
+{
+    if (!s_ || s_->source_path_utf8.empty() || stream_index < 0) {
+        return {};
+    }
+
+    // Open a dedicated AVFormatContext on the same file. We can't
+    // reuse `s_->fmt` because the decode thread is actively demuxing
+    // from it; sharing would race av_read_frame with the pump. The
+    // per-call open is cheap compared to the subtitle decode itself
+    // and keeps the playback path untouched.
+    AVFormatContext* raw_fmt = nullptr;
+    if (avformat_open_input(
+            &raw_fmt, s_->source_path_utf8.c_str(), nullptr, nullptr) < 0
+        || raw_fmt == nullptr) {
+        log::warn("subtitle extract: open_input failed");
+        return {};
+    }
+    AVFormatCtxPtr fmt{raw_fmt};
+
+    if (avformat_find_stream_info(fmt.get(), nullptr) < 0) {
+        log::warn("subtitle extract: find_stream_info failed");
+        return {};
+    }
+    if (static_cast<unsigned>(stream_index) >= fmt->nb_streams) {
+        return {};
+    }
+    AVStream* st = fmt->streams[stream_index];
+    if (st == nullptr
+        || st->codecpar->codec_type != AVMEDIA_TYPE_SUBTITLE) {
+        return {};
+    }
+
+    // Discard everything else so av_read_frame skips video/audio
+    // packets entirely — massive speedup on long files where the
+    // subtitle track is just a handful of KB of events.
+    for (unsigned i = 0; i < fmt->nb_streams; ++i) {
+        fmt->streams[i]->discard =
+            (static_cast<int>(i) == stream_index)
+                ? AVDISCARD_DEFAULT
+                : AVDISCARD_ALL;
+    }
+
+    const AVCodec* decoder =
+        avcodec_find_decoder(st->codecpar->codec_id);
+    if (decoder == nullptr) {
+        log::warn("subtitle extract: no decoder for codec_id={}",
+                  static_cast<int>(st->codecpar->codec_id));
+        return {};
+    }
+    AVCodecContext* raw_codec = avcodec_alloc_context3(decoder);
+    if (raw_codec == nullptr) {
+        return {};
+    }
+    AVCodecCtxPtr codec{raw_codec};
+    if (avcodec_parameters_to_context(codec.get(), st->codecpar) < 0
+        || avcodec_open2(codec.get(), decoder, nullptr) < 0) {
+        log::warn("subtitle extract: codec open failed");
+        return {};
+    }
+
+    // Header: native ASS streams carry a full Script Info + Styles
+    // block in `codecpar->extradata`; reuse it verbatim so style
+    // definitions referenced by dialogue events still resolve. For
+    // every other codec, FFmpeg's internal "ass" output format emits
+    // events that reference a "Default" style, so a minimal standard
+    // header is sufficient.
+    constexpr const char* kMinimalAssHeader =
+        "[Script Info]\n"
+        "ScriptType: v4.00+\n"
+        "WrapStyle: 0\n"
+        "ScaledBorderAndShadow: yes\n"
+        "PlayResX: 1920\n"
+        "PlayResY: 1080\n"
+        "\n"
+        "[V4+ Styles]\n"
+        "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour,"
+        " OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut,"
+        " ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow,"
+        " Alignment, MarginL, MarginR, MarginV, Encoding\n"
+        "Style: Default,Arial,48,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,"
+        "-1,0,0,0,100,100,0,0,1,2,1,2,20,20,40,1\n"
+        "\n"
+        "[Events]\n"
+        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV,"
+        " Effect, Text\n";
+
+    std::string out;
+    if (st->codecpar->extradata != nullptr
+        && st->codecpar->extradata_size > 0) {
+        out.assign(
+            reinterpret_cast<const char*>(st->codecpar->extradata),
+            static_cast<std::size_t>(st->codecpar->extradata_size));
+        // Some container packagings already end the extradata with the
+        // "[Events]" header + Format line; others stop after [V4+
+        // Styles]. Normalize by appending an Events header iff the
+        // extradata didn't include one — otherwise we'd duplicate it
+        // and libass ignores everything after the second [Events].
+        if (out.find("[Events]") == std::string::npos) {
+            out.append(
+                "\n[Events]\n"
+                "Format: Layer, Start, End, Style, Name, MarginL, MarginR,"
+                " MarginV, Effect, Text\n");
+        }
+        if (!out.empty() && out.back() != '\n') {
+            out.push_back('\n');
+        }
+    } else {
+        out.assign(kMinimalAssHeader);
+    }
+
+    AVPacketPtr pkt{av_packet_alloc()};
+    if (!pkt) {
+        return {};
+    }
+    while (av_read_frame(fmt.get(), pkt.get()) >= 0) {
+        if (pkt->stream_index != stream_index) {
+            av_packet_unref(pkt.get());
+            continue;
+        }
+        AVSubtitle sub{};
+        int got = 0;
+        const int r = avcodec_decode_subtitle2(
+            codec.get(), &sub, &got, pkt.get());
+        av_packet_unref(pkt.get());
+        if (r < 0) {
+            continue;
+        }
+        if (got != 0) {
+            for (unsigned i = 0; i < sub.num_rects; ++i) {
+                const AVSubtitleRect* rect = sub.rects[i];
+                if (rect == nullptr || rect->ass == nullptr) {
+                    continue;
+                }
+                // `rect->ass` is already a full "Dialogue: ..." line
+                // from FFmpeg's ASS output formatter. Append as-is,
+                // ensuring a trailing newline.
+                out.append(rect->ass);
+                if (out.empty() || out.back() != '\n') {
+                    out.push_back('\n');
+                }
+            }
+        }
+        avsubtitle_free(&sub);
+    }
+
+    return out;
 }
 
 bool FFmpegSource::switch_audio_stream_while_stopped(int stream_index) noexcept

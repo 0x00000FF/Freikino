@@ -1,12 +1,14 @@
 #include "subtitle_overlay.h"
 
 #include "freikino/common/log.h"
+#include "freikino/common/strings.h"
+#include "freikino/media/ffmpeg_source.h"
 #include "freikino/render/overlay_renderer.h"
 #include "playback.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <utility>
-#include <vector>
 
 namespace freikino::app {
 
@@ -22,7 +24,6 @@ std::vector<std::uint8_t> expand_mask_to_bgra(
     const auto g = static_cast<std::uint8_t>((img.color_rgba >> 16) & 0xFF);
     const auto b = static_cast<std::uint8_t>((img.color_rgba >>  8) & 0xFF);
     const auto t = static_cast<std::uint8_t>( img.color_rgba        & 0xFF);
-    // Event alpha (opacity) = 255 - transparency.
     const std::uint32_t event_alpha = 255u - t;
 
     std::vector<std::uint8_t> buf;
@@ -34,10 +35,9 @@ std::vector<std::uint8_t> expand_mask_to_bgra(
         std::uint8_t* dst_row =
             buf.data() + static_cast<std::size_t>(y) * img.width * 4;
         for (int x = 0; x < img.width; ++x) {
-            const std::uint32_t glyph = src_row[x];                 // 0..255
+            const std::uint32_t glyph = src_row[x];
             const std::uint32_t alpha =
-                (glyph * event_alpha + 127u) / 255u;                // 0..255
-            // D2D premultiplied BGRA.
+                (glyph * event_alpha + 127u) / 255u;
             dst_row[x * 4 + 0] = static_cast<std::uint8_t>((b * alpha + 127u) / 255u);
             dst_row[x * 4 + 1] = static_cast<std::uint8_t>((g * alpha + 127u) / 255u);
             dst_row[x * 4 + 2] = static_cast<std::uint8_t>((r * alpha + 127u) / 255u);
@@ -47,45 +47,195 @@ std::vector<std::uint8_t> expand_mask_to_bgra(
     return buf;
 }
 
+std::wstring format_embedded_label(
+    const media::FFmpegSource::SubtitleTrack& t, std::size_t ordinal)
+{
+    wchar_t buf[160] = {};
+    const std::wstring codec = utf8_to_wide(t.codec_name);
+    const std::wstring lang  = t.language.empty()
+        ? std::wstring{L"und"} : utf8_to_wide(t.language);
+    const std::wstring title = utf8_to_wide(t.title);
+    std::swprintf(
+        buf, 160,
+        L"#%zu  %-4s  %s%s%s",
+        ordinal + 1,
+        lang.c_str(),
+        codec.empty() ? L"?" : codec.c_str(),
+        title.empty() ? L"" : L"  \x2014  ",
+        title.c_str());
+    return std::wstring{buf};
+}
+
 } // namespace
 
 void SubtitleOverlay::create(render::OverlayRenderer& renderer)
 {
     (void)renderer;
     // No one-shot D2D resources needed — bitmaps are made on demand
-    // from each ASS_Image tile and cached in `cache_`.
+    // from each ASS_Image tile and cached per track in `cache`.
+}
+
+void SubtitleOverlay::set_source(media::FFmpegSource* src) noexcept
+{
+    if (source_ == src) {
+        return;
+    }
+    // Drop all embedded tracks bound to the previous source. External
+    // slot (if any) is preserved so dropping a subtitle on one file
+    // and switching to another via the playlist doesn't lose the
+    // external caption the user just loaded.
+    tracks_.erase(
+        std::remove_if(
+            tracks_.begin(), tracks_.end(),
+            [](const std::unique_ptr<Track>& t) {
+                return t && !t->external;
+            }),
+        tracks_.end());
+    source_ = src;
+    sync_embedded_tracks();
+}
+
+void SubtitleOverlay::sync_embedded_tracks() noexcept
+{
+    if (source_ == nullptr) {
+        return;
+    }
+    const auto streams = source_->subtitle_tracks();
+    std::size_t ordinal = 0;
+    for (const auto& st : streams) {
+        ++ordinal;
+        // Already present?
+        bool exists = false;
+        for (const auto& t : tracks_) {
+            if (t && !t->external && t->stream_index == st.stream_index) {
+                exists = true;
+                break;
+            }
+        }
+        if (exists) {
+            continue;
+        }
+        auto t = std::make_unique<Track>();
+        t->external     = false;
+        t->stream_index = st.stream_index;
+        t->available    = st.is_text;
+        t->label        = format_embedded_label(st, ordinal - 1);
+        tracks_.push_back(std::move(t));
+    }
 }
 
 bool SubtitleOverlay::load(const std::wstring& path)
 {
-    cache_.clear();
-    cache_dirty_ = true;
-    images_.clear();
+    // Find (or create) the single external slot; kept as tracks_[0]
+    // by convention so `current_name()` and the encoding-reload path
+    // can reach it without a linear search.
+    Track* slot = external_track();
+    if (slot == nullptr) {
+        auto t = std::make_unique<Track>();
+        t->external  = true;
+        t->available = true;
+        tracks_.insert(tracks_.begin(), std::move(t));
+        slot = tracks_.front().get();
+    }
+    if (slot->source == nullptr) {
+        slot->source = std::make_unique<subtitle::SubtitleSource>();
+    }
+    if (slot->renderer == nullptr) {
+        slot->renderer = std::make_unique<subtitle::SubtitleRenderer>();
+    }
 
-    if (!source_.open(path, forced_encoding_)) {
-        renderer_.set_source(nullptr);
-        current_name_.clear();
-        current_path_.clear();
+    if (!slot->source->open(path, forced_encoding_)) {
+        slot->renderer->set_source(nullptr);
+        slot->ever_loaded = false;
+        slot->active      = false;
+        slot->label.clear();
+        external_path_.clear();
+        active_display_name_.clear();
         return false;
     }
-    renderer_.set_source(&source_);
+    slot->renderer->set_source(slot->source.get());
+    slot->ever_loaded   = true;
+    slot->active        = true;
+    slot->cache_dirty   = true;
+    slot->cache.clear();
+    slot->images.clear();
 
-    // Keep just the basename for display on the setup overlay.
     const auto slash = path.find_last_of(L"\\/");
-    current_name_ = (slash == std::wstring::npos)
-        ? path : path.substr(slash + 1);
-    current_path_ = path;
+    slot->label = (slash == std::wstring::npos) ? path : path.substr(slash + 1);
+    external_path_       = path;
+    active_display_name_ = slot->label;
+
+    apply_settings(*slot);
     return true;
 }
 
 void SubtitleOverlay::clear() noexcept
 {
-    renderer_.set_source(nullptr);
-    cache_.clear();
-    cache_dirty_ = true;
-    images_.clear();
-    current_name_.clear();
-    current_path_.clear();
+    tracks_.clear();
+    external_path_.clear();
+    active_display_name_.clear();
+}
+
+bool SubtitleOverlay::loaded() const noexcept
+{
+    for (const auto& t : tracks_) {
+        if (t && t->active && t->ever_loaded && t->source
+            && t->source->loaded()) {
+            return true;
+        }
+    }
+    return false;
+}
+
+const std::wstring& SubtitleOverlay::current_name() const noexcept
+{
+    // Prefer the active external track for the setup overlay's
+    // "source:" line — that's the label the user is most likely to
+    // identify. Fall back to the first active embedded track, then
+    // to empty.
+    const Track* ext = external_track();
+    if (ext != nullptr && ext->active && ext->ever_loaded) {
+        return ext->label;
+    }
+    for (const auto& t : tracks_) {
+        if (t && t->active && t->ever_loaded) {
+            return t->label;
+        }
+    }
+    static const std::wstring kEmpty;
+    return kEmpty;
+}
+
+void SubtitleOverlay::set_delay_ns(int64_t ns) noexcept
+{
+    delay_ns_ = ns;
+    for (auto& t : tracks_) {
+        if (t && t->source) {
+            t->source->set_delay_ns(ns);
+        }
+    }
+}
+
+void SubtitleOverlay::set_font_scale(float s) noexcept
+{
+    font_scale_ = s;
+    for (auto& t : tracks_) {
+        if (t && t->renderer) {
+            t->renderer->set_font_scale(s);
+            t->cache_dirty = true;
+        }
+    }
+}
+
+void SubtitleOverlay::set_font_override(std::string family) noexcept
+{
+    font_override_ = std::move(family);
+    for (auto& t : tracks_) {
+        if (t && t->renderer) {
+            t->renderer->set_font_override(font_override_);
+            t->cache_dirty = true;
+        }
+    }
 }
 
 void SubtitleOverlay::set_forced_encoding(std::string enc)
@@ -94,103 +244,240 @@ void SubtitleOverlay::set_forced_encoding(std::string enc)
         return;
     }
     forced_encoding_ = std::move(enc);
-    // Reload the same file under the new encoding so the change is
-    // visible immediately. load() resets name/path on failure, so if
-    // the new encoding breaks the parse the user at least gets a
-    // clear "subtitle gone" rather than stale glyphs.
-    if (!current_path_.empty()) {
-        const std::wstring path = current_path_;
+    // Only the external slot is affected by the encoding cycle —
+    // embedded tracks ship in UTF-8-over-ASS format from FFmpeg's
+    // converter and aren't ambiguous.
+    if (!external_path_.empty()) {
+        const std::wstring path = external_path_;
         (void)load(path);
     }
+}
+
+std::size_t SubtitleOverlay::track_count() const noexcept
+{
+    return tracks_.size();
+}
+
+std::vector<SubtitleOverlay::TrackInfo> SubtitleOverlay::list_tracks() const
+{
+    std::vector<TrackInfo> out;
+    out.reserve(tracks_.size());
+    for (const auto& t : tracks_) {
+        if (!t) continue;
+        TrackInfo info;
+        info.active    = t->active && t->ever_loaded;
+        info.available = t->available;
+        if (t->external) {
+            info.label = L"external: ";
+            if (t->label.empty()) {
+                info.label += L"(not loaded)";
+            } else {
+                info.label += t->label;
+            }
+        } else {
+            info.label = L"embedded: " + t->label;
+            if (!t->available) {
+                info.label += L"  (image-based)";
+            }
+        }
+        out.push_back(std::move(info));
+    }
+    return out;
+}
+
+void SubtitleOverlay::toggle_track(std::size_t index) noexcept
+{
+    if (index >= tracks_.size()) {
+        return;
+    }
+    Track* t = tracks_[index].get();
+    if (t == nullptr || !t->available) {
+        return;
+    }
+    if (t->external) {
+        // External slot — requires a prior load(). Toggling only flips
+        // the active flag; we don't re-extract anything.
+        if (!t->ever_loaded) {
+            return;
+        }
+        t->active      = !t->active;
+        t->cache_dirty = true;
+    } else {
+        if (!t->ever_loaded) {
+            if (!ensure_embedded_loaded(*t)) {
+                return;
+            }
+        }
+        t->active      = !t->active;
+        t->cache_dirty = true;
+    }
+
+    // Refresh the display name with whatever's currently active.
+    active_display_name_.clear();
+    for (const auto& tr : tracks_) {
+        if (tr && tr->active && tr->ever_loaded) {
+            active_display_name_ = tr->label;
+            break;
+        }
+    }
+}
+
+bool SubtitleOverlay::ensure_embedded_loaded(Track& t) noexcept
+{
+    if (t.ever_loaded) {
+        return true;
+    }
+    if (t.extraction_attempted) {
+        // A previous extraction failed — don't spin on it. The user
+        // can still toggle, but the track will stay inert.
+        return false;
+    }
+    t.extraction_attempted = true;
+    if (source_ == nullptr || t.stream_index < 0) {
+        return false;
+    }
+    std::string ass = source_->extract_subtitle_ass(t.stream_index);
+    if (ass.empty()) {
+        log::warn("subtitle: embedded extraction returned empty for stream {}",
+                  t.stream_index);
+        return false;
+    }
+    if (t.source == nullptr) {
+        t.source = std::make_unique<subtitle::SubtitleSource>();
+    }
+    if (t.renderer == nullptr) {
+        t.renderer = std::make_unique<subtitle::SubtitleRenderer>();
+    }
+    if (!t.source->open_from_memory(std::move(ass), t.label)) {
+        return false;
+    }
+    t.renderer->set_source(t.source.get());
+    t.ever_loaded = true;
+    apply_settings(t);
+    return true;
+}
+
+void SubtitleOverlay::apply_settings(Track& t) noexcept
+{
+    if (t.source) {
+        t.source->set_delay_ns(delay_ns_);
+    }
+    if (t.renderer) {
+        t.renderer->set_font_scale(font_scale_);
+        t.renderer->set_font_override(font_override_);
+    }
+}
+
+SubtitleOverlay::Track* SubtitleOverlay::external_track() noexcept
+{
+    for (auto& t : tracks_) {
+        if (t && t->external) {
+            return t.get();
+        }
+    }
+    return nullptr;
+}
+
+const SubtitleOverlay::Track* SubtitleOverlay::external_track() const noexcept
+{
+    for (const auto& t : tracks_) {
+        if (t && t->external) {
+            return t.get();
+        }
+    }
+    return nullptr;
 }
 
 void SubtitleOverlay::draw(
     ID2D1DeviceContext* ctx, UINT w, UINT h) noexcept
 {
-    if (ctx == nullptr || !source_.loaded() || playback_ == nullptr) {
+    if (ctx == nullptr || playback_ == nullptr) {
         return;
     }
     if (w == 0 || h == 0) {
         return;
     }
 
-    // Keep libass in sync with the current window size. We reduce
-    // the reported canvas height by the transport bar's footprint so
-    // libass lays subtitles out above the bar — the rendered tiles'
-    // dst_y values then land in the upper portion of the screen and
-    // never sit behind the bar's scrub/buttons.
-    //
-    // We always reserve the space (even when the transport is
-    // faded out) so subtitles don't jump up and down every time the
-    // user moves the mouse. A small dead zone at the bottom is the
-    // better tradeoff — most subtitles are bottom-anchored and the
-    // user expects a small gap above the edge anyway.
+    // Share the libass canvas size across every track — we reduce
+    // the reported height by the transport bar's footprint so
+    // captions land above it regardless of which track produced
+    // them. Always reserve the space so subtitles don't jump up
+    // and down as the bar auto-hides.
     constexpr int kTransportBarPx = 96;
     const int canvas_h =
         (static_cast<int>(h) > kTransportBarPx + 40)
             ? static_cast<int>(h) - kTransportBarPx
             : static_cast<int>(h);
-    if (static_cast<int>(w) != last_w_ || canvas_h != last_h_) {
+
+    const bool size_changed =
+        (static_cast<int>(w) != last_w_ || canvas_h != last_h_);
+    if (size_changed) {
         last_w_ = static_cast<int>(w);
         last_h_ = canvas_h;
-        renderer_.set_frame_size(last_w_, last_h_);
-        cache_dirty_ = true;
     }
 
     const int64_t now = playback_->current_time_ns();
-    const bool changed = renderer_.render_at(now, images_);
-    if (changed) {
-        cache_dirty_ = true;
-    }
 
-    if (cache_dirty_) {
-        cache_.clear();
-        cache_.reserve(images_.size());
+    D2D1_BITMAP_PROPERTIES props{};
+    props.pixelFormat.format    = DXGI_FORMAT_B8G8R8A8_UNORM;
+    props.pixelFormat.alphaMode = D2D1_ALPHA_MODE_PREMULTIPLIED;
+    props.dpiX = 96.0f;
+    props.dpiY = 96.0f;
 
-        D2D1_BITMAP_PROPERTIES props{};
-        props.pixelFormat.format    = DXGI_FORMAT_B8G8R8A8_UNORM;
-        props.pixelFormat.alphaMode = D2D1_ALPHA_MODE_PREMULTIPLIED;
-        props.dpiX = 96.0f;
-        props.dpiY = 96.0f;
+    for (auto& tptr : tracks_) {
+        if (!tptr) continue;
+        Track& t = *tptr;
+        if (!t.active || !t.ever_loaded || !t.renderer) continue;
 
-        for (const auto& img : images_) {
-            if (img.width <= 0 || img.height <= 0) continue;
-            const std::vector<std::uint8_t> bgra = expand_mask_to_bgra(img);
-
-            CachedBitmap c;
-            c.dst_x = img.dst_x;
-            c.dst_y = img.dst_y;
-            c.w     = img.width;
-            c.h     = img.height;
-
-            const HRESULT hr = ctx->CreateBitmap(
-                D2D1::SizeU(static_cast<UINT32>(img.width),
-                            static_cast<UINT32>(img.height)),
-                bgra.data(),
-                static_cast<UINT32>(img.width) * 4,
-                props,
-                &c.bmp);
-            if (FAILED(hr)) {
-                // Skip this tile; others may still upload.
-                continue;
-            }
-            cache_.push_back(std::move(c));
+        if (size_changed) {
+            t.renderer->set_frame_size(last_w_, last_h_);
+            t.cache_dirty = true;
         }
-        cache_dirty_ = false;
-    }
+        const bool changed = t.renderer->render_at(now, t.images);
+        if (changed) {
+            t.cache_dirty = true;
+        }
 
-    for (const auto& c : cache_) {
-        if (!c.bmp) continue;
-        const D2D1_RECT_F dst = D2D1::RectF(
-            static_cast<float>(c.dst_x),
-            static_cast<float>(c.dst_y),
-            static_cast<float>(c.dst_x + c.w),
-            static_cast<float>(c.dst_y + c.h));
-        ctx->DrawBitmap(
-            c.bmp.Get(),
-            dst,
-            1.0f,
-            D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+        if (t.cache_dirty) {
+            t.cache.clear();
+            t.cache.reserve(t.images.size());
+            for (const auto& img : t.images) {
+                if (img.width <= 0 || img.height <= 0) continue;
+                const std::vector<std::uint8_t> bgra = expand_mask_to_bgra(img);
+
+                CachedBitmap c;
+                c.dst_x = img.dst_x;
+                c.dst_y = img.dst_y;
+                c.w     = img.width;
+                c.h     = img.height;
+                const HRESULT hr = ctx->CreateBitmap(
+                    D2D1::SizeU(static_cast<UINT32>(img.width),
+                                static_cast<UINT32>(img.height)),
+                    bgra.data(),
+                    static_cast<UINT32>(img.width) * 4,
+                    props,
+                    &c.bmp);
+                if (FAILED(hr)) {
+                    continue;
+                }
+                t.cache.push_back(std::move(c));
+            }
+            t.cache_dirty = false;
+        }
+
+        for (const auto& c : t.cache) {
+            if (!c.bmp) continue;
+            const D2D1_RECT_F dst = D2D1::RectF(
+                static_cast<float>(c.dst_x),
+                static_cast<float>(c.dst_y),
+                static_cast<float>(c.dst_x + c.w),
+                static_cast<float>(c.dst_y + c.h));
+            ctx->DrawBitmap(
+                c.bmp.Get(),
+                dst,
+                1.0f,
+                D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+        }
     }
 }
 
