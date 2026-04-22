@@ -1256,10 +1256,6 @@ struct SubtitleSource::State {
     ASS_Track*          track   = nullptr;
     std::atomic_int64_t delay_ns{0};
     std::wstring        label;
-    // Snapshot of each style's MarginV captured lazily on the first
-    // `set_margin_v_offset` call. Keeps multi-track stacking additive
-    // (delta from the track's own baseline) rather than absolute.
-    std::vector<int>    original_margin_v;
 
     ~State()
     {
@@ -1462,27 +1458,6 @@ int64_t SubtitleSource::delay_ns() const noexcept
 {
     return s_ != nullptr
         ? s_->delay_ns.load(std::memory_order_acquire) : 0;
-}
-
-void SubtitleSource::set_margin_v_offset(int delta_px) noexcept
-{
-    if (s_ == nullptr || s_->track == nullptr) {
-        return;
-    }
-    if (s_->original_margin_v.empty()) {
-        s_->original_margin_v.reserve(
-            static_cast<std::size_t>(s_->track->n_styles));
-        for (int i = 0; i < s_->track->n_styles; ++i) {
-            s_->original_margin_v.push_back(s_->track->styles[i].MarginV);
-        }
-    }
-    const int n = (std::min)(
-        static_cast<int>(s_->original_margin_v.size()),
-        s_->track->n_styles);
-    for (int i = 0; i < n; ++i) {
-        s_->track->styles[i].MarginV =
-            s_->original_margin_v[static_cast<std::size_t>(i)] + delta_px;
-    }
 }
 
 } // namespace freikino::subtitle

@@ -190,7 +190,6 @@ bool SubtitleOverlay::load(const std::wstring& path)
                 break;
             }
         }
-        update_stack_positions();
         return true;
     }
 
@@ -215,7 +214,6 @@ bool SubtitleOverlay::load(const std::wstring& path)
 
     external_path_       = path;
     active_display_name_ = basename;
-    update_stack_positions();
     return true;
 }
 
@@ -275,9 +273,6 @@ void SubtitleOverlay::set_font_scale(float s) noexcept
             t->cache_dirty = true;
         }
     }
-    // Stack step tracks the font size so rows stay separated when
-    // the user scales captions up.
-    update_stack_positions();
 }
 
 void SubtitleOverlay::set_font_override(std::string family) noexcept
@@ -373,7 +368,6 @@ void SubtitleOverlay::toggle_track(std::size_t index) noexcept
             break;
         }
     }
-    update_stack_positions();
 }
 
 bool SubtitleOverlay::ensure_embedded_loaded(Track& t) noexcept
@@ -419,28 +413,6 @@ void SubtitleOverlay::apply_settings(Track& t) noexcept
     if (t.renderer) {
         t.renderer->set_font_scale(font_scale_);
         t.renderer->set_font_override(font_override_);
-    }
-}
-
-void SubtitleOverlay::update_stack_positions() noexcept
-{
-    // Stack step scales with the user's font-size override so the
-    // rows stay separated when captions grow. Clamp so extreme
-    // small-font settings don't produce barely-distinguishable rows.
-    const int step = (std::max)(
-        20, static_cast<int>(60.0f * font_scale_ + 0.5f));
-    int slot = 0;
-    for (auto& tptr : tracks_) {
-        if (!tptr) continue;
-        Track& t = *tptr;
-        if (!t.active || !t.ever_loaded || !t.source) {
-            // Deactivated tracks can stay at their last offset — they
-            // don't render, and the next activation will recompute.
-            continue;
-        }
-        t.source->set_margin_v_offset(slot * step);
-        t.cache_dirty = true;
-        ++slot;
     }
 }
 
@@ -494,22 +466,28 @@ void SubtitleOverlay::draw(
 
     const int64_t now = playback_->current_time_ns();
 
-    D2D1_BITMAP_PROPERTIES props{};
-    props.pixelFormat.format    = DXGI_FORMAT_B8G8R8A8_UNORM;
-    props.pixelFormat.alphaMode = D2D1_ALPHA_MODE_PREMULTIPLIED;
-    props.dpiX = 96.0f;
-    props.dpiY = 96.0f;
+    // ---- Pass 1: render + collect bounds ----
+    // Each active track renders at libass's natural position (no
+    // MarginV hacks). We then measure its rendered bounding box and
+    // compute a cumulative shift so the Nth track stacks above the
+    // (N-1)th — honouring each track's actual multi-line height
+    // instead of assuming one-line subs.
+    struct TrackBounds {
+        int  min_y       = 0;
+        int  max_y       = 0;
+        bool has_content = false;
+    };
+    std::vector<TrackBounds> bounds(tracks_.size());
 
-    for (auto& tptr : tracks_) {
-        if (!tptr) continue;
-        Track& t = *tptr;
+    for (std::size_t i = 0; i < tracks_.size(); ++i) {
+        Track& t = *tracks_[i];
         if (!t.active || !t.ever_loaded || !t.renderer) continue;
 
         // Must run every frame, not just on window resize: a newly
         // activated track's renderer is freshly constructed with
         // frame_w/h = 0 and would silently produce nothing until the
-        // next resize event nudged it. SubtitleRenderer::set_frame_size
-        // has an internal no-op guard for the unchanged-size case, so
+        // next resize event. SubtitleRenderer::set_frame_size has an
+        // internal no-op guard for the unchanged-size case, so
         // calling it unconditionally is cheap.
         t.renderer->set_frame_size(last_w_, last_h_);
         if (size_changed) {
@@ -519,6 +497,55 @@ void SubtitleOverlay::draw(
         if (changed) {
             t.cache_dirty = true;
         }
+
+        auto& b = bounds[i];
+        for (const auto& img : t.images) {
+            if (img.width <= 0 || img.height <= 0) continue;
+            if (!b.has_content) {
+                b.min_y = img.dst_y;
+                b.max_y = img.dst_y + img.height;
+                b.has_content = true;
+            } else {
+                if (img.dst_y < b.min_y) {
+                    b.min_y = img.dst_y;
+                }
+                if (img.dst_y + img.height > b.max_y) {
+                    b.max_y = img.dst_y + img.height;
+                }
+            }
+        }
+    }
+
+    // ---- Compute per-track shift ----
+    // The first active track with content sits at its natural
+    // position (shift_y = 0). The next track gets shifted up by the
+    // first's rendered height + a small gap. An active track with
+    // no current caption contributes no height to the stack; it
+    // still takes the cumulative shift so it lines up sanely when a
+    // caption arrives.
+    constexpr int kStackGap = 10;
+    int cumulative = 0;
+    for (std::size_t i = 0; i < tracks_.size(); ++i) {
+        Track& t = *tracks_[i];
+        if (!t.active || !t.ever_loaded) continue;
+        t.shift_y = -cumulative;
+        if (bounds[i].has_content) {
+            const int height = bounds[i].max_y - bounds[i].min_y;
+            cumulative += height + kStackGap;
+        }
+    }
+
+    // ---- Pass 2: refresh cache + draw ----
+    D2D1_BITMAP_PROPERTIES props{};
+    props.pixelFormat.format    = DXGI_FORMAT_B8G8R8A8_UNORM;
+    props.pixelFormat.alphaMode = D2D1_ALPHA_MODE_PREMULTIPLIED;
+    props.dpiX = 96.0f;
+    props.dpiY = 96.0f;
+
+    for (auto& tptr : tracks_) {
+        if (!tptr) continue;
+        Track& t = *tptr;
+        if (!t.active || !t.ever_loaded) continue;
 
         if (t.cache_dirty) {
             t.cache.clear();
@@ -549,11 +576,12 @@ void SubtitleOverlay::draw(
 
         for (const auto& c : t.cache) {
             if (!c.bmp) continue;
+            const float dy = static_cast<float>(c.dst_y + t.shift_y);
             const D2D1_RECT_F dst = D2D1::RectF(
                 static_cast<float>(c.dst_x),
-                static_cast<float>(c.dst_y),
+                dy,
                 static_cast<float>(c.dst_x + c.w),
-                static_cast<float>(c.dst_y + c.h));
+                dy + static_cast<float>(c.h));
             ctx->DrawBitmap(
                 c.bmp.Get(),
                 dst,
