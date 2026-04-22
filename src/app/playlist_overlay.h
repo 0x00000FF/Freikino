@@ -76,6 +76,16 @@ public:
     // clicks targeting playlist rows.
     [[nodiscard]] bool hit_panel(int x, int y, UINT width, UINT height) const noexcept;
 
+    // True while the user is dragging the left edge to resize. The
+    // window uses this to SetCapture so the drag still tracks when
+    // the cursor leaves the panel.
+    [[nodiscard]] bool is_resizing() const noexcept { return resizing_; }
+
+    // Hit-test: is the given point over the resize grip strip? Used
+    // by MainWindow's WM_SETCURSOR to swap in the east-west arrow.
+    [[nodiscard]] bool hit_resize_grip(int x, int y,
+                                       UINT width, UINT height) const noexcept;
+
     void draw(ID2D1DeviceContext* ctx, UINT width, UINT height) noexcept;
 
 private:
@@ -102,6 +112,14 @@ private:
     std::size_t hover_row_  = static_cast<std::size_t>(-1);
     std::size_t press_row_  = static_cast<std::size_t>(-1);
     float       scroll_off_ = 0.0f;  // reserved for future
+
+    // Resizing state. `panel_width_` is the user-controlled width;
+    // `resizing_` is set on mouse-down inside the left-edge grip,
+    // and clamped to [kMinPanelW, window width / 2] on drag.
+    float       panel_width_       = 320.0f;
+    bool        resizing_          = false;
+    float       resize_anchor_x_   = 0.0f;   // cursor x at drag start
+    float       resize_anchor_w_   = 0.0f;   // panel_width at drag start
 
     // Selection model. `selection_` is the set of selected indices;
     // `anchor_` is the pivot used for shift-range selection — the last

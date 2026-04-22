@@ -13,11 +13,12 @@ namespace freikino::app {
 
 namespace {
 
-constexpr float kPanelWidth    = 320.0f;
 constexpr float kHeaderHeight  = 44.0f;
 constexpr float kRowHeight     = 32.0f;
 constexpr float kPadX          = 14.0f;
 constexpr float kBarHeightPx   = 96.0f;   // keep clear of transport bar
+constexpr float kMinPanelW     = 180.0f;  // narrow enough to still read
+constexpr float kResizeGripW   = 6.0f;    // grip strip on the panel's left
 
 constexpr std::size_t kNoRow = static_cast<std::size_t>(-1);
 
@@ -93,7 +94,7 @@ PlaylistOverlay::compute_layout(UINT w, UINT h) const noexcept
     const float fw = static_cast<float>(w);
     const float fh = static_cast<float>(h);
 
-    l.panel.left   = fw - kPanelWidth;
+    l.panel.left   = fw - panel_width_;
     l.panel.top    = 0.0f;
     l.panel.right  = fw;
     l.panel.bottom = fh - kBarHeightPx;
@@ -147,6 +148,21 @@ bool PlaylistOverlay::hit_panel(int x, int y, UINT w, UINT h) const noexcept
     return hit_rect(l.panel, x, y);
 }
 
+bool PlaylistOverlay::hit_resize_grip(
+    int x, int y, UINT w, UINT h) const noexcept
+{
+    if (!visible_) return false;
+    const Layout l = compute_layout(w, h);
+    // Grip is a narrow vertical strip centred on the panel's left edge.
+    D2D1_RECT_F grip{
+        l.panel.left - kResizeGripW * 0.5f,
+        l.panel.top,
+        l.panel.left + kResizeGripW * 0.5f,
+        l.panel.bottom,
+    };
+    return hit_rect(grip, x, y);
+}
+
 void PlaylistOverlay::on_mouse_move(int x, int y, UINT w, UINT h) noexcept
 {
     mouse_x_ = x;
@@ -155,6 +171,22 @@ void PlaylistOverlay::on_mouse_move(int x, int y, UINT w, UINT h) noexcept
         hover_row_ = kNoRow;
         return;
     }
+
+    // Resize drag takes priority over row hover — while dragging, the
+    // cursor may leave the panel entirely and we still want to track
+    // the new width.
+    if (resizing_) {
+        const float fw = static_cast<float>(w);
+        const float delta = resize_anchor_x_ - static_cast<float>(x);
+        float new_w = resize_anchor_w_ + delta;
+        if (new_w < kMinPanelW) new_w = kMinPanelW;
+        const float max_w = fw - 120.0f;   // leave some video area visible
+        if (new_w > max_w) new_w = max_w;
+        if (new_w < kMinPanelW) new_w = kMinPanelW;
+        panel_width_ = new_w;
+        return;
+    }
+
     const Layout l = compute_layout(w, h);
     hover_row_ = row_at(y, l);
 }
@@ -166,6 +198,17 @@ void PlaylistOverlay::on_lbutton_down(
         press_row_ = kNoRow;
         return;
     }
+
+    // Resize grip check comes first — it overlaps the panel's left
+    // edge, which is otherwise inside the row area.
+    if (hit_resize_grip(x, y, w, h)) {
+        resizing_        = true;
+        resize_anchor_x_ = static_cast<float>(x);
+        resize_anchor_w_ = panel_width_;
+        press_row_       = kNoRow;
+        return;
+    }
+
     const Layout l = compute_layout(w, h);
     if (!hit_rect(l.panel, x, y)) {
         press_row_ = kNoRow;
@@ -215,6 +258,7 @@ void PlaylistOverlay::on_lbutton_up(int x, int y, UINT w, UINT h) noexcept
     (void)y;
     (void)w;
     (void)h;
+    resizing_ = false;
     // Selection already committed on mouse-down; nothing to do here.
     // Double-click is delivered as a separate WM_LBUTTONDBLCLK.
     press_row_ = kNoRow;
@@ -281,6 +325,15 @@ void PlaylistOverlay::draw(ID2D1DeviceContext* ctx, UINT w, UINT h) noexcept
 
     // Panel background.
     ctx->FillRectangle(l.panel, brush_bg_.Get());
+
+    // Resize grip — subtle light line on the panel's left edge. Uses
+    // the selected-row brush for a muted look that's visible but
+    // doesn't compete with the rows.
+    const D2D1_RECT_F grip_rect{
+        l.panel.left - 1.0f, l.panel.top,
+        l.panel.left + 1.0f, l.panel.bottom,
+    };
+    ctx->FillRectangle(grip_rect, brush_row_selected_.Get());
 
     // Header text.
     if (text_title_) {

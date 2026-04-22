@@ -319,6 +319,28 @@ LRESULT MainWindow::on_message(UINT msg, WPARAM wparam, LPARAM lparam)
     case WM_NCHITTEST:
         return on_nchittest(lparam);
 
+    case WM_SETCURSOR: {
+        // Swap to the east-west arrow over the playlist resize grip.
+        // Default handling elsewhere.
+        if (reinterpret_cast<HWND>(wparam) == handle()
+            && LOWORD(lparam) == HTCLIENT) {
+            POINT pt{};
+            if (::GetCursorPos(&pt)
+                && ::ScreenToClient(handle(), &pt)) {
+                RECT rc{};
+                if (::GetClientRect(handle(), &rc)
+                    && playlist_overlay_.hit_resize_grip(
+                        pt.x, pt.y,
+                        static_cast<UINT>(rc.right),
+                        static_cast<UINT>(rc.bottom))) {
+                    ::SetCursor(::LoadCursorW(nullptr, IDC_SIZEWE));
+                    return TRUE;
+                }
+            }
+        }
+        break;
+    }
+
     case WM_NCLBUTTONDBLCLK:
         // Double-click is HTCAPTION for both the real title bar AND
         // our video-area override. Only intercept for the video area;
@@ -685,13 +707,18 @@ void MainWindow::on_lbutton_down(int x, int y) noexcept
     const UINT h = static_cast<UINT>(rc.bottom);
     // Route to the playlist first when the click is on its panel —
     // transport doesn't overlap that region, so no need to forward
-    // both when the playlist consumes it.
-    if (playlist_overlay_.hit_panel(x, y, w, h)) {
+    // both when the playlist consumes it. The resize grip sits just
+    // outside the panel rect on its left edge, so check it separately.
+    if (playlist_overlay_.hit_panel(x, y, w, h)
+        || playlist_overlay_.hit_resize_grip(x, y, w, h)) {
         const bool ctrl =
             (::GetKeyState(VK_CONTROL) & 0x8000) != 0;
         const bool shift =
             (::GetKeyState(VK_SHIFT)   & 0x8000) != 0;
         playlist_overlay_.on_lbutton_down(x, y, w, h, ctrl, shift);
+        if (playlist_overlay_.is_resizing()) {
+            (void)::SetCapture(handle());
+        }
         return;
     }
     transport_overlay_.on_lbutton_down(x, y, w, h);
@@ -971,8 +998,13 @@ LRESULT MainWindow::on_nchittest(LPARAM lparam) noexcept
         return HTCLIENT;
     }
     // Playlist panel is interactive — exempt it from the drag-to-move
-    // override so rows can be clicked.
+    // override so rows can be clicked. Same for the resize grip on
+    // its left edge, which sits just outside the panel rect.
     if (playlist_overlay_.hit_panel(
+            pt.x, pt.y,
+            static_cast<UINT>(rc.right),
+            static_cast<UINT>(rc.bottom))
+        || playlist_overlay_.hit_resize_grip(
             pt.x, pt.y,
             static_cast<UINT>(rc.right),
             static_cast<UINT>(rc.bottom))) {
