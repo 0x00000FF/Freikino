@@ -220,10 +220,14 @@ TransportOverlay::compute_layout(UINT w, UINT h) const noexcept
     l.volume_popup_panel.bottom = l.volume_button.top - kVolPopupGap;
     l.volume_popup_panel.top    = l.volume_popup_panel.bottom - kVolPopupH;
     // Hit region spans the popup + the gap + the speaker so moving
-    // between them doesn't unhover-dismiss the slider.
+    // between them doesn't unhover-dismiss the slider. The horizontal
+    // padding (20 px) is wide enough that normal diagonal cursor
+    // motion from the speaker toward the slider knob stays inside
+    // the region — a narrower margin used to dismiss the popup as
+    // the user aimed for it.
     l.volume_popup_hit = l.volume_popup_panel;
-    l.volume_popup_hit.left   -= 4.0f;
-    l.volume_popup_hit.right  += 4.0f;
+    l.volume_popup_hit.left   -= 20.0f;
+    l.volume_popup_hit.right  += 20.0f;
     l.volume_popup_hit.bottom  = l.volume_button.bottom;
 
     l.volume_slider_x  = (l.volume_popup_panel.left + l.volume_popup_panel.right) * 0.5f;
@@ -310,10 +314,32 @@ void TransportOverlay::on_mouse_move(int x, int y, UINT w, UINT h) noexcept
     // the panel isn't drawn until the user actually targets the icon.
     const bool on_speaker = hit(l.volume_button, x, y);
     const bool on_popup_hit = hit(l.volume_popup_hit, x, y);
+    constexpr ULONGLONG kVolHoverGraceMs = 350;
     if (!hover_volume_) {
         hover_volume_ = on_speaker;
+        if (hover_volume_) {
+            volume_hover_grace_start_ms_ = 0;
+        }
     } else {
-        hover_volume_ = on_speaker || on_popup_hit || volume_dragging_;
+        if (on_speaker || on_popup_hit || volume_dragging_) {
+            hover_volume_ = true;
+            volume_hover_grace_start_ms_ = 0;
+        } else {
+            // Cursor has just left the speaker/popup hit area. Hold
+            // the popup open briefly so a brief off-axis drift (or an
+            // overshoot past the popup's edge while aiming at the
+            // slider knob) doesn't dismiss the panel before the user
+            // can click. The grace timer resets whenever the cursor
+            // wanders back inside.
+            const ULONGLONG now_ms = ::GetTickCount64();
+            if (volume_hover_grace_start_ms_ == 0) {
+                volume_hover_grace_start_ms_ = now_ms;
+            }
+            if (now_ms - volume_hover_grace_start_ms_ > kVolHoverGraceMs) {
+                hover_volume_ = false;
+                volume_hover_grace_start_ms_ = 0;
+            }
+        }
     }
     hover_seek_ = hit(l.seek_hit, x, y);
     if (seek_dragging_) {
@@ -502,6 +528,7 @@ void TransportOverlay::on_mouse_leave() noexcept
         hover_fs_     = false;
         hover_seek_   = false;
         hover_volume_ = false;
+        volume_hover_grace_start_ms_ = 0;
     }
 }
 

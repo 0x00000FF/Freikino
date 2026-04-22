@@ -165,6 +165,13 @@ private:
     bool     hover_fs_        = false;
     bool     hover_seek_      = false;
     bool     hover_volume_    = false;   // over speaker OR popup panel
+    // Timestamp of the first mouse-move after the cursor left the
+    // volume hit region while `hover_volume_` was still true. While
+    // non-zero and within `kVolHoverGraceMs`, the popup stays up so
+    // a slight diagonal drift while aiming for the slider doesn't
+    // dismiss the panel before the user can click on it. Cleared
+    // whenever the cursor re-enters the hit region.
+    ULONGLONG volume_hover_grace_start_ms_ = 0;
     bool     volume_dragging_ = false;   // mouse-down inside slider track
     bool     seek_dragging_   = false;
     PressBtn press_btn_       = PressBtn::None;
