@@ -44,6 +44,52 @@ public:
 
     [[nodiscard]] bool loaded() const noexcept { return source_.loaded(); }
 
+    // Basename of the most recently loaded subtitle (empty if none).
+    // Shown on the subtitle setup overlay so the user knows which
+    // track the adjustments apply to.
+    [[nodiscard]] const std::wstring& current_name() const noexcept
+    {
+        return current_name_;
+    }
+
+    // Subtitle sync offset (positive = show later). Persists across
+    // seek / pause / rebinds.
+    void set_delay_ns(int64_t ns) noexcept { source_.set_delay_ns(ns); }
+    [[nodiscard]] int64_t delay_ns() const noexcept
+    {
+        return source_.delay_ns();
+    }
+
+    // Font size multiplier (1.0 = ASS default). Clamped inside the
+    // renderer.
+    void set_font_scale(float s) noexcept { renderer_.set_font_scale(s); }
+    [[nodiscard]] float font_scale() const noexcept
+    {
+        return renderer_.font_scale();
+    }
+
+    // Override the font face for every dialogue line (UTF-8 face
+    // name). Empty = use the track's own styles.
+    void set_font_override(std::string family) noexcept
+    {
+        renderer_.set_font_override(std::move(family));
+    }
+    [[nodiscard]] const std::string& font_override() const noexcept
+    {
+        return renderer_.font_override();
+    }
+
+    // Force a specific text encoding ("utf-8", "utf-16le", "cp949",
+    // "cp932", …). Empty = auto-detect. Changing the encoding while
+    // a subtitle is loaded triggers an in-place reload of the same
+    // file with the new setting so the user sees the effect
+    // immediately.
+    void set_forced_encoding(std::string enc);
+    [[nodiscard]] const std::string& forced_encoding() const noexcept
+    {
+        return forced_encoding_;
+    }
+
     void draw(ID2D1DeviceContext* ctx, UINT width, UINT height) noexcept;
 
 private:
@@ -51,6 +97,12 @@ private:
     subtitle::SubtitleSource      source_;
     subtitle::SubtitleRenderer    renderer_;
     std::vector<subtitle::RenderedImage> images_;
+    std::wstring                  current_name_;
+    // Full path of the most-recent successful load — kept so the
+    // user can reload the same file under a different encoding from
+    // the setup overlay.
+    std::wstring                  current_path_;
+    std::string                   forced_encoding_;
 
     // D2D bitmap cache — one bitmap per subtitle image, regenerated
     // whenever the image set changes. Cached across calls so the

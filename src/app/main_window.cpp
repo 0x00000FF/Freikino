@@ -15,6 +15,7 @@
 
 #include <windows.h>
 #include <windowsx.h>
+#include <commdlg.h>
 #include <dwmapi.h>
 #include <shellapi.h>
 
@@ -126,6 +127,8 @@ void MainWindow::create(HINSTANCE instance)
         playlist_overlay_.set_play_request(
             &MainWindow::playlist_play_request, this);
         subtitle_overlay_.create(overlay_renderer_);
+        subtitle_setup_overlay_.create(overlay_renderer_);
+        subtitle_setup_overlay_.set_subtitle_overlay(&subtitle_overlay_);
         spectrum_.create(overlay_renderer_);
         audio_info_overlay_.create(overlay_renderer_);
         title_toast_.create(overlay_renderer_);
@@ -157,6 +160,7 @@ void MainWindow::create(HINSTANCE instance)
                     // off. Below transport so the bar still reads.
                     opening_overlay_.draw(ctx, w, h);
                     transport_overlay_.draw(ctx, w, h);
+                    subtitle_setup_overlay_.draw(ctx, w, h);
                     debug_overlay_.draw(ctx, w, h);
                     overlay_renderer_.end_draw();
                 }
@@ -514,6 +518,129 @@ void MainWindow::on_keydown(WPARAM vk, bool repeat) noexcept
         case 'P':
             if (!repeat) {
                 toggle_incognito();
+            }
+            break;
+        case 'S':
+            if (!repeat) {
+                subtitle_setup_overlay_.toggle_visible();
+                transport_overlay_.bump_activity();
+            }
+            break;
+        case VK_OEM_COMMA:
+            // ',' — nudge subtitle delay earlier by 100ms. Only while
+            // the setup panel is open so this key stays free for
+            // future bindings in the normal viewing state.
+            if (subtitle_setup_overlay_.visible()
+                && subtitle_overlay_.loaded()) {
+                subtitle_overlay_.set_delay_ns(
+                    subtitle_overlay_.delay_ns() - 100'000'000LL);
+                transport_overlay_.bump_activity();
+            }
+            break;
+        case VK_OEM_PERIOD:
+            // '.' — nudge subtitle delay later by 100ms.
+            if (subtitle_setup_overlay_.visible()
+                && subtitle_overlay_.loaded()) {
+                subtitle_overlay_.set_delay_ns(
+                    subtitle_overlay_.delay_ns() + 100'000'000LL);
+                transport_overlay_.bump_activity();
+            }
+            break;
+        case VK_OEM_MINUS:
+            // '-' — shrink subtitle font.
+            if (subtitle_setup_overlay_.visible()
+                && subtitle_overlay_.loaded()) {
+                subtitle_overlay_.set_font_scale(
+                    subtitle_overlay_.font_scale() - 0.1f);
+                transport_overlay_.bump_activity();
+            }
+            break;
+        case VK_OEM_PLUS:
+            // '=' (same physical key as '+') — grow subtitle font.
+            if (subtitle_setup_overlay_.visible()
+                && subtitle_overlay_.loaded()) {
+                subtitle_overlay_.set_font_scale(
+                    subtitle_overlay_.font_scale() + 0.1f);
+                transport_overlay_.bump_activity();
+            }
+            break;
+        case '0':
+            if (subtitle_setup_overlay_.visible()
+                && subtitle_overlay_.loaded()) {
+                subtitle_overlay_.set_delay_ns(0);
+                transport_overlay_.bump_activity();
+            }
+            break;
+        case 'E':
+            // Cycle the forced subtitle encoding. Heuristics can't
+            // always tell CP949-that-happens-to-be-valid-UTF-8 from
+            // real UTF-8, so the user gets an explicit override.
+            // Order: auto → utf-8 → utf-16le → utf-16be → cp949 →
+            // cp932 → cp936 → cp1252 → auto. The subtitle reloads
+            // from the same path on each press.
+            if (!repeat
+                && subtitle_setup_overlay_.visible()
+                && subtitle_overlay_.loaded()) {
+                static constexpr const char* kOrder[] = {
+                    "", "utf-8", "utf-16le", "utf-16be",
+                    "cp949", "cp932", "cp936", "cp1252",
+                };
+                const std::string& cur = subtitle_overlay_.forced_encoding();
+                std::size_t idx = 0;
+                for (std::size_t i = 0;
+                     i < sizeof(kOrder) / sizeof(kOrder[0]); ++i) {
+                    if (cur == kOrder[i]) { idx = i; break; }
+                }
+                idx = (idx + 1) % (sizeof(kOrder) / sizeof(kOrder[0]));
+                subtitle_overlay_.set_forced_encoding(kOrder[idx]);
+                transport_overlay_.bump_activity();
+            }
+            break;
+        case 'F':
+            // Pops the system font picker so the user can swap the
+            // subtitle face to something with the glyphs their track
+            // actually needs — Arial lacks Hebrew / many CJK ranges,
+            // which is what triggers libass's "failed to find any
+            // fallback with glyph" fontselect warnings.
+            if (!repeat
+                && subtitle_setup_overlay_.visible()
+                && subtitle_overlay_.loaded()) {
+                LOGFONTW lf{};
+                lf.lfHeight = -16;
+                lf.lfCharSet = DEFAULT_CHARSET;
+                // Pre-fill with the current override so the dialog
+                // opens on the user's last choice.
+                const std::string& cur = subtitle_overlay_.font_override();
+                if (!cur.empty()) {
+                    try {
+                        const std::wstring w = utf8_to_wide(cur);
+                        const std::size_t n = (std::min<std::size_t>)(
+                            w.size(), LF_FACESIZE - 1);
+                        std::copy_n(w.begin(), n, lf.lfFaceName);
+                        lf.lfFaceName[n] = L'\0';
+                    } catch (...) {
+                        lf.lfFaceName[0] = L'\0';
+                    }
+                }
+
+                CHOOSEFONTW cf{};
+                cf.lStructSize = sizeof(cf);
+                cf.hwndOwner   = handle();
+                cf.lpLogFont   = &lf;
+                cf.Flags       = CF_SCREENFONTS | CF_SCALABLEONLY
+                               | CF_INITTOLOGFONTSTRUCT | CF_NOVERTFONTS;
+
+                if (::ChooseFontW(&cf)) {
+                    try {
+                        subtitle_overlay_.set_font_override(
+                            wide_to_utf8(lf.lfFaceName));
+                        log::info("subtitle: font override = '{}'",
+                                  wide_to_utf8(lf.lfFaceName));
+                    } catch (...) {
+                        log::warn("subtitle: font name conversion failed");
+                    }
+                }
+                transport_overlay_.bump_activity();
             }
             break;
         default:

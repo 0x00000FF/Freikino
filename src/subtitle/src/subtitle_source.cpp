@@ -15,6 +15,8 @@
 #include <utility>
 #include <vector>
 
+#include <windows.h>
+
 #include <ass/ass.h>
 
 namespace freikino::subtitle {
@@ -71,19 +73,328 @@ bool read_file_bytes(const std::wstring& path, std::string& out)
     return true;
 }
 
-// Detect UTF-8/UTF-16 BOM and normalise to UTF-8 bytes. SAMI files in
-// the wild are frequently CP949 / Shift-JIS, but attempting a full
-// codepage round-trip from a lone subtitle is out of scope; we treat
-// anything non-UTF as raw bytes and let libass's internal logic try
-// to render. For BOM-less CP949 SAMI the user can re-save as UTF-8.
-void strip_bom_inplace(std::string& s) noexcept
+// Returns true if `s` is a well-formed UTF-8 byte sequence.
+bool is_valid_utf8(const std::string& s) noexcept
 {
-    if (s.size() >= 3
-        && static_cast<unsigned char>(s[0]) == 0xEF
-        && static_cast<unsigned char>(s[1]) == 0xBB
-        && static_cast<unsigned char>(s[2]) == 0xBF) {
-        s.erase(0, 3);
+    std::size_t i = 0;
+    while (i < s.size()) {
+        const auto c = static_cast<unsigned char>(s[i]);
+        std::size_t extra;
+        if (c < 0x80) {
+            extra = 0;
+        } else if ((c & 0xE0) == 0xC0) {
+            if (c < 0xC2) return false;        // overlong
+            extra = 1;
+        } else if ((c & 0xF0) == 0xE0) {
+            extra = 2;
+        } else if ((c & 0xF8) == 0xF0) {
+            if (c > 0xF4) return false;        // > U+10FFFF
+            extra = 3;
+        } else {
+            return false;
+        }
+        if (i + extra >= s.size()) return false;
+        for (std::size_t j = 1; j <= extra; ++j) {
+            if ((static_cast<unsigned char>(s[i + j]) & 0xC0) != 0x80) {
+                return false;
+            }
+        }
+        i += extra + 1;
     }
+    return true;
+}
+
+std::string wide_to_utf8_str(const wchar_t* data, int count) noexcept
+{
+    if (count <= 0) return {};
+    const int n = ::WideCharToMultiByte(
+        CP_UTF8, 0, data, count, nullptr, 0, nullptr, nullptr);
+    if (n <= 0) return {};
+    std::string out(static_cast<std::size_t>(n), '\0');
+    ::WideCharToMultiByte(
+        CP_UTF8, 0, data, count, out.data(), n, nullptr, nullptr);
+    return out;
+}
+
+std::string decode_utf16le(const char* data, std::size_t len) noexcept
+{
+    const auto* src = reinterpret_cast<const wchar_t*>(data);
+    return wide_to_utf8_str(src, static_cast<int>(len / sizeof(wchar_t)));
+}
+
+std::string decode_utf16be(const char* data, std::size_t len) noexcept
+{
+    std::wstring w;
+    w.reserve(len / 2);
+    for (std::size_t i = 0; i + 1 < len; i += 2) {
+        const auto hi = static_cast<unsigned char>(data[i]);
+        const auto lo = static_cast<unsigned char>(data[i + 1]);
+        w.push_back(static_cast<wchar_t>(
+            (static_cast<std::uint16_t>(hi) << 8) | lo));
+    }
+    return wide_to_utf8_str(w.data(), static_cast<int>(w.size()));
+}
+
+// Heuristic for BOM-less UTF-16 detection. Every subtitle format has
+// ASCII scaffolding — SMI has <SYNC>, <BODY>; SRT has "-->" timecodes;
+// ASS has "[Script Info]" — and in UTF-16 those ASCII bytes are
+// always paired with a NUL companion. For LE the NUL sits at the odd
+// position, for BE at the even position. Counting that specific
+// "ASCII byte + NUL byte" pair pattern is robust against pure-CJK
+// content (where zero-byte counts flip sides between LE and BE) and
+// against legacy codepages (where NULs don't appear at all).
+enum class Utf16Guess { None, LE, BE };
+Utf16Guess guess_utf16_no_bom(const std::string& bytes) noexcept
+{
+    if (bytes.size() < 8) return Utf16Guess::None;
+    const std::size_t sample =
+        (std::min<std::size_t>)(bytes.size() & ~std::size_t{1}, 512);
+    std::size_t le_hits = 0;   // ASCII at even, NUL at odd  → UTF-16 LE
+    std::size_t be_hits = 0;   // NUL at even, ASCII at odd  → UTF-16 BE
+    for (std::size_t i = 0; i + 1 < sample; i += 2) {
+        const auto even = static_cast<unsigned char>(bytes[i]);
+        const auto odd  = static_cast<unsigned char>(bytes[i + 1]);
+        const bool even_ascii = (even >= 0x20 && even < 0x7F);
+        const bool odd_ascii  = (odd  >= 0x20 && odd  < 0x7F);
+        if (even_ascii && odd  == 0x00) ++le_hits;
+        if (odd_ascii  && even == 0x00) ++be_hits;
+    }
+    // 10 paired hits plus a 6x dominance over the other side keeps
+    // legitimate legacy-codepage text (which has no such pairs at all)
+    // from tripping the detector.
+    if (le_hits >= 10 && le_hits >= 6 * be_hits) return Utf16Guess::LE;
+    if (be_hits >= 10 && be_hits >= 6 * le_hits) return Utf16Guess::BE;
+    return Utf16Guess::None;
+}
+
+// After is_valid_utf8() passes, sanity-check the decoded codepoint
+// distribution. CP949 lead bytes 0xC2-0xDF with a trail in 0xA0-0xBF
+// are *structurally* valid UTF-8 and decode to U+0080-U+07FF —
+// predominantly Cyrillic / Armenian / Hebrew / Arabic / Syriac.
+// (Canonical failure mode: bytes D7 B7 → U+05F7, an *unassigned*
+// Hebrew codepoint — libass logs "failed to find any fallback with
+// glyph 0x5F7" because nothing in Unicode has one.)
+//
+// Discriminator: a real Hebrew / Russian / Arabic subtitle lives in
+// ONE of those blocks almost exclusively, while a CP949-as-UTF-8
+// mis-decode scatters codepoints across several of them
+// simultaneously. Count how many distinct scripts in the suspicious
+// zone are *actively populated* — two or more active scripts plus
+// zero CJK / Hangul anchors indicates the trap.
+bool looks_like_cp949_masquerading_as_utf8(const std::string& s) noexcept
+{
+    std::size_t greek    = 0;   // U+0370-U+03FF
+    std::size_t cyrillic = 0;   // U+0400-U+04FF (+ suppl. U+0500-U+052F)
+    std::size_t armenian = 0;   // U+0530-U+058F
+    std::size_t hebrew   = 0;   // U+0590-U+05FF
+    std::size_t arabic   = 0;   // U+0600-U+06FF
+    std::size_t syriac   = 0;   // U+0700-U+074F
+    std::size_t cjk      = 0;   // real CJK / Hangul / kana — anchors
+    std::size_t i = 0;
+    while (i < s.size()) {
+        const auto c = static_cast<unsigned char>(s[i]);
+        std::size_t extra;
+        std::uint32_t cp;
+        if (c < 0x80) { ++i; continue; }
+        if ((c & 0xE0) == 0xC0)      { extra = 1; cp = c & 0x1Fu; }
+        else if ((c & 0xF0) == 0xE0) { extra = 2; cp = c & 0x0Fu; }
+        else if ((c & 0xF8) == 0xF0) { extra = 3; cp = c & 0x07u; }
+        else                         { ++i; continue; }
+        if (i + extra >= s.size()) break;
+        for (std::size_t j = 1; j <= extra; ++j) {
+            cp = (cp << 6)
+               | (static_cast<unsigned char>(s[i + j]) & 0x3Fu);
+        }
+        if      (cp >= 0x0370u && cp <= 0x03FFu) ++greek;
+        else if (cp >= 0x0400u && cp <= 0x052Fu) ++cyrillic;
+        else if (cp >= 0x0530u && cp <= 0x058Fu) ++armenian;
+        else if (cp >= 0x0590u && cp <= 0x05FFu) ++hebrew;
+        else if (cp >= 0x0600u && cp <= 0x06FFu) ++arabic;
+        else if (cp >= 0x0700u && cp <= 0x074Fu) ++syriac;
+        else if ((cp >= 0x3000u && cp <= 0x30FFu)     // CJK sym. + kana
+              || (cp >= 0x3400u && cp <= 0x4DBFu)     // CJK Ext A
+              || (cp >= 0x4E00u && cp <= 0x9FFFu)     // CJK Unified
+              || (cp >= 0xAC00u && cp <= 0xD7AFu)     // Hangul Syllables
+              || (cp >= 0xF900u && cp <= 0xFAFFu))    // CJK Compat.
+        {
+            ++cjk;
+        }
+        i += extra + 1;
+    }
+    // A real file with CJK content anchors the identification — if we
+    // saw any CJK codepoints at all in the UTF-8 decode, the file is
+    // genuinely UTF-8, not CP949 masquerading.
+    if (cjk > 0) {
+        return false;
+    }
+    auto active = [](std::size_t n) { return n >= 3 ? 1 : 0; };
+    const int scripts = active(greek) + active(cyrillic) + active(armenian)
+                      + active(hebrew) + active(arabic) + active(syriac);
+    const std::size_t total = greek + cyrillic + armenian
+                            + hebrew + arabic + syriac;
+    // Two or more scripts simultaneously active in the suspicious
+    // zone is the CP949 scatter fingerprint. A single dense script
+    // (pure Hebrew, pure Russian, etc.) passes as legitimate.
+    return scripts >= 2 && total >= 10;
+}
+
+// Decode `bytes` in-place from the named codepage into UTF-8. Returns
+// true on success. Used by the manual encoding override path.
+bool decode_with_codepage(std::string& bytes, UINT codepage) noexcept
+{
+    const int wlen = ::MultiByteToWideChar(
+        codepage, 0,
+        bytes.data(), static_cast<int>(bytes.size()),
+        nullptr, 0);
+    if (wlen <= 0) return false;
+    std::wstring wide(static_cast<std::size_t>(wlen), L'\0');
+    ::MultiByteToWideChar(
+        codepage, 0,
+        bytes.data(), static_cast<int>(bytes.size()),
+        wide.data(), wlen);
+    bytes = wide_to_utf8_str(wide.data(), wlen);
+    return true;
+}
+
+// Map a user-supplied encoding label (case-insensitive) to a Windows
+// codepage number, or 0 for UTF-8 / UTF-16 handled specially by the
+// caller. An empty label means "auto-detect", handled one level up.
+// Accepts the canonical names the setup overlay cycles through plus
+// the bare numeric forms ("949", "932", …) so advanced users can type
+// whatever the file actually was saved as.
+struct EncodingSpec {
+    enum class Kind { Auto, Utf8, Utf16Le, Utf16Be, Codepage };
+    Kind kind     = Kind::Auto;
+    UINT codepage = 0;
+};
+EncodingSpec resolve_encoding(const std::string& name) noexcept
+{
+    std::string s;
+    s.reserve(name.size());
+    for (char c : name) {
+        s.push_back(static_cast<char>(std::tolower(
+            static_cast<unsigned char>(c))));
+    }
+    // Strip hyphens so "utf-8" == "utf8", "cp-949" == "cp949".
+    s.erase(std::remove(s.begin(), s.end(), '-'), s.end());
+
+    EncodingSpec out;
+    if (s.empty() || s == "auto") {
+        out.kind = EncodingSpec::Kind::Auto;
+        return out;
+    }
+    if (s == "utf8") {
+        out.kind = EncodingSpec::Kind::Utf8;
+        return out;
+    }
+    if (s == "utf16" || s == "utf16le") {
+        out.kind = EncodingSpec::Kind::Utf16Le;
+        return out;
+    }
+    if (s == "utf16be") {
+        out.kind = EncodingSpec::Kind::Utf16Be;
+        return out;
+    }
+    // "cp949" / "cp932" / "cp936" / "cp1252" / ... or bare "949" etc.
+    std::string digits = s;
+    if (digits.rfind("cp", 0) == 0) digits = digits.substr(2);
+    if (digits.rfind("windows", 0) == 0) digits = digits.substr(7);
+    UINT cp = 0;
+    bool any = false;
+    for (char c : digits) {
+        if (c < '0' || c > '9') { any = false; break; }
+        cp = cp * 10 + static_cast<UINT>(c - '0');
+        any = true;
+    }
+    if (any && cp != 0) {
+        out.kind     = EncodingSpec::Kind::Codepage;
+        out.codepage = cp;
+        return out;
+    }
+    // Unknown — treat as auto so the pipeline still tries something.
+    out.kind = EncodingSpec::Kind::Auto;
+    return out;
+}
+
+// Subtitle files come in a zoo of encodings. We normalise to UTF-8
+// so downstream converters (which scan for ASCII tags like <sync>
+// and ASCII digits) work uniformly, and libass gets the UTF-8 it
+// expects:
+//   * UTF-8 BOM → strip.
+//   * UTF-16 LE / BE BOM → decode.
+//   * No BOM, UTF-16 zero-byte signature → decode.
+//   * No BOM, valid UTF-8 → keep.
+//   * No BOM, not UTF-8 → assume CP_ACP (CP949 on KR Windows, CP932
+//     on JP, CP936 on CN) and convert.
+// Returns a short tag of the detected encoding for logging.
+const char* normalize_to_utf8(std::string& bytes) noexcept
+{
+    // UTF-8 BOM.
+    if (bytes.size() >= 3
+        && static_cast<unsigned char>(bytes[0]) == 0xEF
+        && static_cast<unsigned char>(bytes[1]) == 0xBB
+        && static_cast<unsigned char>(bytes[2]) == 0xBF) {
+        bytes.erase(0, 3);
+        return "utf-8(bom)";
+    }
+    // UTF-16 LE BOM.
+    if (bytes.size() >= 2
+        && static_cast<unsigned char>(bytes[0]) == 0xFF
+        && static_cast<unsigned char>(bytes[1]) == 0xFE) {
+        bytes = decode_utf16le(bytes.data() + 2, bytes.size() - 2);
+        return "utf-16le(bom)";
+    }
+    // UTF-16 BE BOM.
+    if (bytes.size() >= 2
+        && static_cast<unsigned char>(bytes[0]) == 0xFE
+        && static_cast<unsigned char>(bytes[1]) == 0xFF) {
+        bytes = decode_utf16be(bytes.data() + 2, bytes.size() - 2);
+        return "utf-16be(bom)";
+    }
+    // UTF-16 without BOM — very common for SAMI out of legacy
+    // authoring tools. Detect before is_valid_utf8 because ASCII
+    // bytes plus NULs look structurally valid as UTF-8.
+    switch (guess_utf16_no_bom(bytes)) {
+    case Utf16Guess::LE:
+        bytes = decode_utf16le(bytes.data(), bytes.size());
+        return "utf-16le(heur)";
+    case Utf16Guess::BE:
+        bytes = decode_utf16be(bytes.data(), bytes.size());
+        return "utf-16be(heur)";
+    case Utf16Guess::None:
+        break;
+    }
+    const bool structural_utf8 = is_valid_utf8(bytes);
+    if (structural_utf8 && !looks_like_cp949_masquerading_as_utf8(bytes)) {
+        return "utf-8";
+    }
+    // Try the system ANSI code page. MB_ERR_INVALID_CHARS makes the
+    // call fail cleanly on bytes that aren't a valid sequence in
+    // CP_ACP, instead of silently substituting with U+FFFD — which is
+    // what produced the � characters in the previous build. A clean
+    // failure lets us fall back to the original bytes when our CP-949
+    // suspicion turns out to be wrong.
+    const int wlen = ::MultiByteToWideChar(
+        CP_ACP, MB_ERR_INVALID_CHARS,
+        bytes.data(), static_cast<int>(bytes.size()),
+        nullptr, 0);
+    if (wlen <= 0) {
+        if (structural_utf8) {
+            // CP_ACP refused; the UTF-8 decode is our best shot even
+            // though it looked suspicious. Keeping the bytes here
+            // means at worst a few fontselect warnings, not a whole
+            // track full of � placeholders.
+            return "utf-8(kept)";
+        }
+        return "ansi(failed)";
+    }
+    std::wstring wide(static_cast<std::size_t>(wlen), L'\0');
+    ::MultiByteToWideChar(
+        CP_ACP, MB_ERR_INVALID_CHARS,
+        bytes.data(), static_cast<int>(bytes.size()),
+        wide.data(), wlen);
+    bytes = wide_to_utf8_str(wide.data(), wlen);
+    return structural_utf8 ? "ansi(utf8-masquerade)" : "ansi";
 }
 
 // ---------------------------------------------------------------------------
@@ -430,7 +741,8 @@ SubtitleSource::SubtitleSource()
 
 SubtitleSource::~SubtitleSource() = default;
 
-bool SubtitleSource::open(const std::wstring& path)
+bool SubtitleSource::open(
+    const std::wstring& path, const std::string& forced_encoding)
 {
     if (s_->track != nullptr) {
         ass_free_track(s_->track);
@@ -455,17 +767,73 @@ bool SubtitleSource::open(const std::wstring& path)
         log::error("subtitle: cannot read {}", wide_to_utf8(path));
         return false;
     }
-    strip_bom_inplace(bytes);
 
+    const EncodingSpec spec = resolve_encoding(forced_encoding);
+    std::string enc_tag;
+    const char* enc = nullptr;
+    switch (spec.kind) {
+    case EncodingSpec::Kind::Auto:
+        enc = normalize_to_utf8(bytes);
+        break;
+    case EncodingSpec::Kind::Utf8:
+        // If the file opens with a UTF-8 BOM, strip it even in forced
+        // mode — libass refuses the BOM'd bytes at the start of an
+        // ASS header.
+        if (bytes.size() >= 3
+            && static_cast<unsigned char>(bytes[0]) == 0xEF
+            && static_cast<unsigned char>(bytes[1]) == 0xBB
+            && static_cast<unsigned char>(bytes[2]) == 0xBF) {
+            bytes.erase(0, 3);
+        }
+        enc = "utf-8(forced)";
+        break;
+    case EncodingSpec::Kind::Utf16Le: {
+        std::size_t off = 0;
+        if (bytes.size() >= 2
+            && static_cast<unsigned char>(bytes[0]) == 0xFF
+            && static_cast<unsigned char>(bytes[1]) == 0xFE) {
+            off = 2;
+        }
+        bytes = decode_utf16le(bytes.data() + off, bytes.size() - off);
+        enc = "utf-16le(forced)";
+        break;
+    }
+    case EncodingSpec::Kind::Utf16Be: {
+        std::size_t off = 0;
+        if (bytes.size() >= 2
+            && static_cast<unsigned char>(bytes[0]) == 0xFE
+            && static_cast<unsigned char>(bytes[1]) == 0xFF) {
+            off = 2;
+        }
+        bytes = decode_utf16be(bytes.data() + off, bytes.size() - off);
+        enc = "utf-16be(forced)";
+        break;
+    }
+    case EncodingSpec::Kind::Codepage:
+        if (!decode_with_codepage(bytes, spec.codepage)) {
+            log::warn("subtitle: decode cp{} failed, falling back to auto",
+                      spec.codepage);
+            enc = normalize_to_utf8(bytes);
+        } else {
+            enc_tag = "cp" + std::to_string(spec.codepage) + "(forced)";
+            enc = enc_tag.c_str();
+        }
+        break;
+    }
+
+    const char* fmt_name = "?";
     std::string ass_bytes;
     switch (fmt) {
     case Format::Ass:
+        fmt_name  = "ass";
         ass_bytes = std::move(bytes);
         break;
     case Format::Srt:
+        fmt_name  = "srt";
         ass_bytes = convert_srt_to_ass(bytes);
         break;
     case Format::Smi:
+        fmt_name  = "smi";
         ass_bytes = convert_smi_to_ass(bytes);
         break;
     default:
@@ -476,15 +844,15 @@ bool SubtitleSource::open(const std::wstring& path)
         s_->library,
         ass_bytes.data(),
         ass_bytes.size(),
-        nullptr /* codepage */);
+        nullptr /* codepage — bytes are already UTF-8 */);
     if (s_->track == nullptr) {
         log::error("subtitle: ass_read_memory failed ({})",
                    wide_to_utf8(path));
         return false;
     }
 
-    log::info("subtitle: loaded {} ({} events)",
-              wide_to_utf8(path), s_->track->n_events);
+    log::info("subtitle: loaded {} ({}, {}, {} events)",
+              wide_to_utf8(path), fmt_name, enc, s_->track->n_events);
     return true;
 }
 

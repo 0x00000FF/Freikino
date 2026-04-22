@@ -45,6 +45,18 @@ public:
     // Bind a loaded subtitle source. Nullptr clears. Non-owning.
     void set_source(SubtitleSource* src) noexcept;
 
+    // Multiplier applied to every rendered glyph (1.0 = ASS default).
+    // Persisted across renderer rebuilds triggered by set_source().
+    void  set_font_scale(float scale) noexcept;
+    [[nodiscard]] float font_scale() const noexcept;
+
+    // Force every dialogue event to render with a specific font
+    // family (UTF-8 face name, e.g. "Malgun Gothic"). Passing an
+    // empty string restores per-style track fonts. Survives renderer
+    // rebuilds triggered by set_source().
+    void set_font_override(std::string family) noexcept;
+    [[nodiscard]] const std::string& font_override() const noexcept;
+
     // Render every visible line at the given playback pts. `out` is
     // cleared + repopulated. Returns true if the rendered set changed
     // versus the previous call.

@@ -31,7 +31,16 @@ public:
     // Load a subtitle file. Returns true on success. On failure the
     // object is left empty and the caller can continue without
     // subtitles.
-    bool open(const std::wstring& path);
+    //
+    // `forced_encoding` overrides the auto-detection:
+    //   ""           — auto-detect (BOM / heuristic / CP_ACP)
+    //   "utf-8"      — treat file as UTF-8 as-is
+    //   "utf-16le"   — decode as UTF-16 LE
+    //   "utf-16be"   — decode as UTF-16 BE
+    //   "cp949"/"cp932"/"cp936"/"cp1252" — MultiByteToWideChar on that
+    //                  code page (numeric string works too, e.g. "949")
+    bool open(const std::wstring& path,
+              const std::string& forced_encoding = {});
 
     [[nodiscard]] bool       loaded() const noexcept;
     [[nodiscard]] ASS_Track* track()  const noexcept;

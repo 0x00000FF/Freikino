@@ -9,6 +9,7 @@
 #include "playlist_overlay.h"
 #include "spectrum_visualizer.h"
 #include "subtitle_overlay.h"
+#include "subtitle_setup_overlay.h"
 #include "title_toast.h"
 #include "transport_overlay.h"
 #include "volume_osd.h"
@@ -151,6 +152,7 @@ private:
     TransportOverlay         transport_overlay_;
     PlaylistOverlay          playlist_overlay_;
     SubtitleOverlay          subtitle_overlay_;
+    SubtitleSetupOverlay     subtitle_setup_overlay_;
     SpectrumVisualizer       spectrum_;
     AudioInfoOverlay         audio_info_overlay_;
     TitleToast               title_toast_;

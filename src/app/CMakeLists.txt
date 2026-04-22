@@ -9,6 +9,7 @@ add_executable(freikino WIN32
     playlist_overlay.cpp
     spectrum_visualizer.cpp
     subtitle_overlay.cpp
+    subtitle_setup_overlay.cpp
     title_toast.cpp
     transport_overlay.cpp
     volume_osd.cpp
@@ -26,6 +27,7 @@ target_link_libraries(freikino
         freikino::platform
         freikino::common
         freikino::compile_options
+        comdlg32
         dwmapi
         ole32
         shell32
