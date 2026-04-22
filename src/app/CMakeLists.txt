@@ -1,6 +1,7 @@
 add_executable(freikino WIN32
     main.cpp
     audio_info_overlay.cpp
+    audio_tracks_overlay.cpp
     main_window.cpp
     media_session.cpp
     opening_overlay.cpp

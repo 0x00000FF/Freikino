@@ -100,6 +100,14 @@ public:
     // playback resumes immediately and the user never sees it.
     void frame_step(int direction);
 
+    // Swap the active audio track to the given container stream index.
+    // Tears down and rebuilds the audio codec + swr, flushes decode
+    // queues, and seeks back to the current playback time so the new
+    // track starts where the old one was. No-op if the index already
+    // matches the active stream or points to a non-audio stream.
+    // Returns true on success.
+    bool change_audio_track(int stream_index);
+
 private:
     render::Presenter*       presenter_    = nullptr;
     render::WallClock*       wall_clock_   = nullptr;

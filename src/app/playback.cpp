@@ -274,6 +274,63 @@ void PlaybackController::seek_by(int64_t delta_ns)
 #endif
 }
 
+bool PlaybackController::change_audio_track(int stream_index)
+{
+#if FREIKINO_WITH_MEDIA
+    if (source_ == nullptr) {
+        return false;
+    }
+    if (stream_index == source_->active_audio_stream_index()) {
+        return true;
+    }
+
+    const State prev_state = state_.load(std::memory_order_acquire);
+    const bool was_paused = (prev_state == State::paused);
+    const int64_t resume_ns = current_time_ns();
+
+    log::info("audio: switching to stream #{}", stream_index);
+
+    // Same teardown sequence as seek_to: quiesce the pump, stop the
+    // decoder, drain queues, mutate codec state, seek, restart.
+    if (audio_ != nullptr) {
+        audio_->reset_for_seek();
+    }
+    source_->stop();
+    source_->clear_queues_while_stopped();
+
+    const bool ok = source_->switch_audio_stream_while_stopped(stream_index);
+
+    // Seek even on failure — switch_audio_stream may have left the old
+    // stream intact, but we've already cleared the queues, so we still
+    // need to reseed from the decoder.
+    source_->seek_while_stopped(resume_ns);
+
+    if (presenter_ != nullptr) {
+        presenter_->drop_lookahead();
+    }
+
+    if (has_audio() && audio_ != nullptr && was_paused) {
+        audio_->set_start_pts(resume_ns);
+    } else if (!has_audio() && wall_clock_ != nullptr) {
+        wall_clock_->set_now_ns(resume_ns);
+    }
+
+    source_->start();
+    if (audio_ != nullptr && has_audio() && !was_paused) {
+        audio_->resume();
+    }
+
+    // Force the next seek_to not to short-circuit against the stale
+    // last_seek_target_ns_, in case the user chains a seek immediately.
+    last_seek_target_ns_ = INT64_MIN;
+
+    return ok;
+#else
+    (void)stream_index;
+    return false;
+#endif
+}
+
 void PlaybackController::seek_to(int64_t target_ns)
 {
 #if FREIKINO_WITH_MEDIA

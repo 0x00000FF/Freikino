@@ -1,6 +1,7 @@
 #pragma once
 
 #include "audio_info_overlay.h"
+#include "audio_tracks_overlay.h"
 #include "debug_overlay.h"
 #include "playback.h"
 #include "freikino/render/overlay_renderer.h"
@@ -62,10 +63,12 @@ public:
     }
 
     // Wire the media source so the debug overlay can show queue
-    // depths and decoder push rates.
+    // depths and decoder push rates. Also feeds the audio-tracks
+    // overlay so the list reflects the currently-loaded file.
     void set_debug_source(media::FFmpegSource* source) noexcept
     {
         debug_overlay_.set_media_source(source);
+        audio_tracks_overlay_.set_source(source);
     }
 
     // Hook up the shared playlist + session opener. MediaSession is
@@ -164,6 +167,7 @@ private:
     PlaylistOverlay          playlist_overlay_;
     SubtitleOverlay          subtitle_overlay_;
     SubtitleSetupOverlay     subtitle_setup_overlay_;
+    AudioTracksOverlay       audio_tracks_overlay_;
     SpectrumVisualizer       spectrum_;
     AudioInfoOverlay         audio_info_overlay_;
     TitleToast               title_toast_;

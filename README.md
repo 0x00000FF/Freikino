@@ -51,8 +51,16 @@ you're watching to the rest of your system. Relevant concretely:
 | ------ | ------------------------------------------ |
 | `L`    | Toggle playlist panel                      |
 | `S`    | Toggle subtitle setup panel                |
+| `A`    | Toggle audio track picker                  |
 | `P`    | Toggle incognito mode                      |
 | `F3`   | Toggle debug overlay (FPS / queues / etc.) |
+
+### Audio track picker (with panel open)
+| Key         | Action                                                  |
+| ----------- | ------------------------------------------------------- |
+| `↑` / `↓`   | Move highlight up / down through available tracks       |
+| `Enter`     | Switch to the highlighted track                         |
+| `A` / `Esc` | Close the picker without switching                      |
 
 ### Playlist (with panel open)
 | Action            | Result                                              |

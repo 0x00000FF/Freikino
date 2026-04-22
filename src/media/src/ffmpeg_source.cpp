@@ -168,6 +168,7 @@ struct FFmpegSource::State {
     int64_t                     audio_bit_rate        = 0;
     FFmpegSource::Metadata      metadata;
     FFmpegSource::AlbumArt      album_art;
+    std::vector<FFmpegSource::AudioTrack> audio_tracks;
 
     // Lower bound (with margin) for which frames to push after a seek.
     // `avformat_seek_file` with AVSEEK_FLAG_BACKWARD lands at the
@@ -439,73 +440,46 @@ void FFmpegSource::open(const std::wstring& path)
         log::info("ffmpeg: no video stream");
     }
 
+    // ---- Enumerate audio tracks ----
+    // Built once here so the UI can offer a track picker without
+    // rescanning the container. Static after open(); only the active
+    // `audio_stream_index` changes via switch_audio_stream_while_stopped.
+    auto read_str_tag = [](AVDictionary* d, const char* key) -> std::string {
+        if (d == nullptr) return {};
+        AVDictionaryEntry* e =
+            av_dict_get(d, key, nullptr, AV_DICT_IGNORE_SUFFIX);
+        return (e != nullptr && e->value != nullptr)
+                 ? std::string{e->value} : std::string{};
+    };
+    for (unsigned i = 0; i < s_->fmt->nb_streams; ++i) {
+        AVStream* st = s_->fmt->streams[i];
+        if (st->codecpar->codec_type != AVMEDIA_TYPE_AUDIO) {
+            continue;
+        }
+        AudioTrack t;
+        t.stream_index = static_cast<int>(i);
+        const AVCodec* d =
+            avcodec_find_decoder(st->codecpar->codec_id);
+        if (d != nullptr && d->name != nullptr) {
+            t.codec_name = d->name;
+        }
+        t.language    = read_str_tag(st->metadata, "language");
+        t.title       = read_str_tag(st->metadata, "title");
+        t.channels    = st->codecpar->ch_layout.nb_channels;
+        t.sample_rate = st->codecpar->sample_rate;
+        t.is_default  = (st->disposition & AV_DISPOSITION_DEFAULT) != 0;
+        s_->audio_tracks.push_back(std::move(t));
+    }
+
     // ---- Audio stream ----
     if (s_->audio_target_set) {
         const int audio_idx = av_find_best_stream(
             s_->fmt.get(), AVMEDIA_TYPE_AUDIO, -1, -1, nullptr, 0);
         if (audio_idx >= 0) {
-            AVStream* a_stream = s_->fmt->streams[audio_idx];
-            s_->audio_time_base = a_stream->time_base;
-
-            const AVCodec* a_decoder =
-                avcodec_find_decoder(a_stream->codecpar->codec_id);
-            if (a_decoder == nullptr) {
-                log::warn("ffmpeg: no decoder for audio codec_id={}",
-                          static_cast<int>(a_stream->codecpar->codec_id));
-            } else {
-                AVCodecContext* raw_codec = avcodec_alloc_context3(a_decoder);
-                if (raw_codec == nullptr) {
-                    throw_hresult(E_OUTOFMEMORY);
-                }
-                s_->audio_codec.reset(raw_codec);
-                check_av(avcodec_parameters_to_context(
-                    s_->audio_codec.get(), a_stream->codecpar));
-                s_->audio_codec->pkt_timebase = a_stream->time_base;
-                check_av(avcodec_open2(s_->audio_codec.get(), a_decoder, nullptr));
-
-                AVChannelLayout out_layout{};
-                av_channel_layout_default(
-                    &out_layout, static_cast<int>(s_->target_channels));
-
-                SwrContext* raw_swr = nullptr;
-                const int r = swr_alloc_set_opts2(
-                    &raw_swr,
-                    &out_layout,
-                    AV_SAMPLE_FMT_FLT,
-                    static_cast<int>(s_->target_sample_rate),
-                    &s_->audio_codec->ch_layout,
-                    s_->audio_codec->sample_fmt,
-                    s_->audio_codec->sample_rate,
-                    0, nullptr);
-                av_channel_layout_uninit(&out_layout);
-                if (r < 0 || raw_swr == nullptr) {
-                    log::warn("ffmpeg: swr_alloc_set_opts2 failed; audio disabled");
-                } else {
-                    s_->swr.reset(raw_swr);
-                    if (swr_init(s_->swr.get()) < 0) {
-                        log::warn("ffmpeg: swr_init failed; audio disabled");
-                        s_->swr.reset();
-                    } else {
-                        s_->audio_stream_index    = audio_idx;
-                        s_->audio_codec_name      =
-                            a_decoder->name != nullptr ? a_decoder->name : "";
-                        s_->audio_src_sample_rate = s_->audio_codec->sample_rate;
-                        s_->audio_src_channels    =
-                            s_->audio_codec->ch_layout.nb_channels;
-                        s_->audio_bit_rate =
-                            a_stream->codecpar->bit_rate != 0
-                                ? a_stream->codecpar->bit_rate
-                                : (s_->fmt->bit_rate != 0
-                                    ? s_->fmt->bit_rate : 0);
-                        log::info(
-                            "ffmpeg: audio codec={} src={}Hz/{}ch -> {}Hz/{}ch",
-                            a_decoder->name != nullptr ? a_decoder->name : "?",
-                            s_->audio_codec->sample_rate,
-                            s_->audio_codec->ch_layout.nb_channels,
-                            s_->target_sample_rate,
-                            s_->target_channels);
-                    }
-                }
+            if (!configure_audio_stream(audio_idx)) {
+                // configure_audio_stream already logged the specific
+                // failure; leave audio disabled and let the rest of
+                // open() proceed (video-only playback is valid).
             }
         } else {
             log::info("ffmpeg: no audio stream");
@@ -612,6 +586,24 @@ void FFmpegSource::open(const std::wstring& path)
                   s_->album_art.width, s_->album_art.height);
         break;   // first attached picture is enough
     }
+
+    // Tell the demuxer to drop packets from every stream we didn't pick.
+    // Filtering by stream_index in the decode loop is not enough on its
+    // own: with the default AVDISCARD_DEFAULT, some containers (MPEG-TS
+    // with multiple audio PIDs, MKV with more than one "default" audio
+    // track) still hand secondary audio packets back through av_read_frame
+    // and can, depending on program/substream layout, end up mixing
+    // them into output. AVDISCARD_ALL ensures only the selected streams
+    // are ever demuxed. Album art is safe to discard here — its single
+    // packet lives on st->attached_pic and was already consumed above.
+    for (unsigned i = 0; i < s_->fmt->nb_streams; ++i) {
+        const int idx = static_cast<int>(i);
+        if (idx == s_->video_stream_index
+            || idx == s_->audio_stream_index) {
+            continue;
+        }
+        s_->fmt->streams[i]->discard = AVDISCARD_ALL;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -705,6 +697,172 @@ void FFmpegSource::clear_queues_while_stopped() noexcept
     while (audio_queue_.try_pop(a)) {
         a = {};
     }
+}
+
+std::vector<FFmpegSource::AudioTrack> FFmpegSource::audio_tracks() const noexcept
+{
+    return s_ ? s_->audio_tracks : std::vector<AudioTrack>{};
+}
+
+int FFmpegSource::active_audio_stream_index() const noexcept
+{
+    return s_ ? s_->audio_stream_index : -1;
+}
+
+bool FFmpegSource::switch_audio_stream_while_stopped(int stream_index) noexcept
+{
+    if (!s_ || !s_->fmt) {
+        return false;
+    }
+    if (running_.load(std::memory_order_acquire)) {
+        log::warn("ffmpeg: switch_audio_stream called while running, ignored");
+        return false;
+    }
+    if (!s_->audio_target_set) {
+        // Renderer never provided a mix format — audio output is off.
+        return false;
+    }
+    if (stream_index < 0
+        || static_cast<unsigned>(stream_index) >= s_->fmt->nb_streams) {
+        return false;
+    }
+    AVStream* st = s_->fmt->streams[stream_index];
+    if (st == nullptr
+        || st->codecpar->codec_type != AVMEDIA_TYPE_AUDIO) {
+        return false;
+    }
+    if (stream_index == s_->audio_stream_index) {
+        return true; // already active
+    }
+
+    const int old_index = s_->audio_stream_index;
+
+    // Tear down the old audio codec/swr. The decoder is guaranteed
+    // stopped (precondition), so no thread is still referencing these.
+    s_->swr.reset();
+    s_->audio_codec.reset();
+    s_->audio_stream_index    = -1;
+    s_->audio_codec_name.clear();
+    s_->audio_src_sample_rate = 0;
+    s_->audio_src_channels    = 0;
+    s_->audio_bit_rate        = 0;
+
+    bool ok = false;
+    try {
+        ok = configure_audio_stream(stream_index);
+    } catch (...) {
+        ok = false;
+    }
+
+    if (!ok) {
+        // Try to restore the previous stream so audio keeps working.
+        // If even that fails, audio stays disabled; video continues.
+        if (old_index >= 0) {
+            try {
+                (void)configure_audio_stream(old_index);
+            } catch (...) {
+                // Leave audio disabled.
+            }
+        }
+        return false;
+    }
+
+    // Flip the demuxer-level discard flags so only the new active
+    // stream is demuxed. Without this the decode loop's stream_index
+    // filter would still drop packets from the new stream.
+    for (unsigned i = 0; i < s_->fmt->nb_streams; ++i) {
+        AVStream* s = s_->fmt->streams[i];
+        if (s->codecpar->codec_type != AVMEDIA_TYPE_AUDIO) {
+            continue;
+        }
+        s->discard = (static_cast<int>(i) == s_->audio_stream_index)
+                         ? AVDISCARD_DEFAULT
+                         : AVDISCARD_ALL;
+    }
+
+    // Flush whatever the new decoder had buffered from a prior
+    // open (nothing, strictly, but the call is cheap and defensive).
+    if (s_->audio_codec) {
+        avcodec_flush_buffers(s_->audio_codec.get());
+    }
+    return true;
+}
+
+bool FFmpegSource::configure_audio_stream(int audio_idx)
+{
+    if (!s_ || !s_->fmt
+        || audio_idx < 0
+        || static_cast<unsigned>(audio_idx) >= s_->fmt->nb_streams) {
+        return false;
+    }
+    AVStream* a_stream = s_->fmt->streams[audio_idx];
+    s_->audio_time_base = a_stream->time_base;
+
+    const AVCodec* a_decoder =
+        avcodec_find_decoder(a_stream->codecpar->codec_id);
+    if (a_decoder == nullptr) {
+        log::warn("ffmpeg: no decoder for audio codec_id={}",
+                  static_cast<int>(a_stream->codecpar->codec_id));
+        return false;
+    }
+
+    AVCodecContext* raw_codec = avcodec_alloc_context3(a_decoder);
+    if (raw_codec == nullptr) {
+        throw_hresult(E_OUTOFMEMORY);
+    }
+    s_->audio_codec.reset(raw_codec);
+    check_av(avcodec_parameters_to_context(
+        s_->audio_codec.get(), a_stream->codecpar));
+    s_->audio_codec->pkt_timebase = a_stream->time_base;
+    check_av(avcodec_open2(s_->audio_codec.get(), a_decoder, nullptr));
+
+    AVChannelLayout out_layout{};
+    av_channel_layout_default(
+        &out_layout, static_cast<int>(s_->target_channels));
+
+    SwrContext* raw_swr = nullptr;
+    const int r = swr_alloc_set_opts2(
+        &raw_swr,
+        &out_layout,
+        AV_SAMPLE_FMT_FLT,
+        static_cast<int>(s_->target_sample_rate),
+        &s_->audio_codec->ch_layout,
+        s_->audio_codec->sample_fmt,
+        s_->audio_codec->sample_rate,
+        0, nullptr);
+    av_channel_layout_uninit(&out_layout);
+    if (r < 0 || raw_swr == nullptr) {
+        log::warn("ffmpeg: swr_alloc_set_opts2 failed; audio disabled");
+        s_->audio_codec.reset();
+        return false;
+    }
+    s_->swr.reset(raw_swr);
+    if (swr_init(s_->swr.get()) < 0) {
+        log::warn("ffmpeg: swr_init failed; audio disabled");
+        s_->swr.reset();
+        s_->audio_codec.reset();
+        return false;
+    }
+
+    s_->audio_stream_index    = audio_idx;
+    s_->audio_codec_name      =
+        a_decoder->name != nullptr ? a_decoder->name : "";
+    s_->audio_src_sample_rate = s_->audio_codec->sample_rate;
+    s_->audio_src_channels    = s_->audio_codec->ch_layout.nb_channels;
+    s_->audio_bit_rate        =
+        a_stream->codecpar->bit_rate != 0
+            ? a_stream->codecpar->bit_rate
+            : (s_->fmt->bit_rate != 0 ? s_->fmt->bit_rate : 0);
+
+    log::info(
+        "ffmpeg: audio codec={} stream={} src={}Hz/{}ch -> {}Hz/{}ch",
+        a_decoder->name != nullptr ? a_decoder->name : "?",
+        audio_idx,
+        s_->audio_codec->sample_rate,
+        s_->audio_codec->ch_layout.nb_channels,
+        s_->target_sample_rate,
+        s_->target_channels);
+    return true;
 }
 
 // ---------------------------------------------------------------------------

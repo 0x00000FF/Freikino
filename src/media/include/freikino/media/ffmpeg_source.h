@@ -53,6 +53,14 @@ public:
     // Drain both internal queues. Precondition: same as `seek_while_stopped`.
     void clear_queues_while_stopped() noexcept;
 
+    // Swap the active audio stream. Precondition: same as
+    // `seek_while_stopped`. `stream_index` must be one returned by
+    // `audio_tracks()`; passing the current stream is a no-op. The audio
+    // codec and resampler are reopened in place so the new track shares
+    // the existing target mix format. Returns true on success; on failure
+    // the previous stream is left intact.
+    [[nodiscard]] bool switch_audio_stream_while_stopped(int stream_index) noexcept;
+
     [[nodiscard]] bool try_acquire_video_frame(render::VideoFrame& out) override;
     [[nodiscard]] bool try_acquire_audio_frame(audio::AudioFrame& out) override;
 
@@ -115,6 +123,24 @@ public:
     [[nodiscard]] Metadata  metadata()   const noexcept;
     [[nodiscard]] const AlbumArt& album_art() const noexcept;
 
+    // One entry per audio stream found in the container. Populated at
+    // `open()` and static thereafter (the set of streams doesn't change
+    // during playback — only which one is selected via
+    // `switch_audio_stream_while_stopped`).
+    struct AudioTrack {
+        int         stream_index   = -1;     // AVStream index in the container
+        std::string codec_name;
+        std::string language;                // ISO 639-2 tag or empty
+        std::string title;                   // user-facing track title or empty
+        int         channels        = 0;
+        int         sample_rate     = 0;
+        bool        is_default      = false; // AV_DISPOSITION_DEFAULT
+    };
+    [[nodiscard]] std::vector<AudioTrack> audio_tracks() const noexcept;
+
+    // Stream index of the currently-active audio track, or -1 if none.
+    [[nodiscard]] int active_audio_stream_index() const noexcept;
+
     // Live metrics for the debug overlay.
     [[nodiscard]] std::size_t   video_queue_depth() const noexcept
     {
@@ -143,6 +169,12 @@ public:
 
 private:
     void decode_loop() noexcept;
+
+    // Open the audio codec + resampler for the given container stream
+    // index. On entry, `s_->audio_codec` / `s_->swr` must be cleared.
+    // Returns true on success; logs + leaves the audio disabled
+    // (codec/swr empty) on soft failures. OOM still throws.
+    bool configure_audio_stream(int audio_stream_idx);
 
     struct State;
     std::unique_ptr<State> s_;

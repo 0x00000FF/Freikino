@@ -135,6 +135,7 @@ void MainWindow::create(HINSTANCE instance)
         subtitle_overlay_.create(overlay_renderer_);
         subtitle_setup_overlay_.create(overlay_renderer_);
         subtitle_setup_overlay_.set_subtitle_overlay(&subtitle_overlay_);
+        audio_tracks_overlay_.create(overlay_renderer_);
         spectrum_.create(overlay_renderer_);
         audio_info_overlay_.create(overlay_renderer_);
         title_toast_.create(overlay_renderer_);
@@ -167,6 +168,7 @@ void MainWindow::create(HINSTANCE instance)
                     opening_overlay_.draw(ctx, w, h);
                     transport_overlay_.draw(ctx, w, h);
                     subtitle_setup_overlay_.draw(ctx, w, h);
+                    audio_tracks_overlay_.draw(ctx, w, h);
                     debug_overlay_.draw(ctx, w, h);
                     overlay_renderer_.end_draw();
                 }
@@ -458,13 +460,56 @@ void MainWindow::on_size(UINT width, UINT height) noexcept
 void MainWindow::on_keydown(WPARAM vk, bool repeat) noexcept
 {
     if (vk == VK_ESCAPE) {
-        // Escape exits fullscreen first, only closes if already windowed.
+        // Escape closes the audio-tracks picker first (so it can act
+        // like a modal panel). Otherwise: exit fullscreen, then close.
+        if (audio_tracks_overlay_.visible()) {
+            audio_tracks_overlay_.hide();
+            transport_overlay_.bump_activity();
+            return;
+        }
         if (fs_active_) {
             toggle_fullscreen();
         } else {
             ::PostMessageW(handle(), WM_CLOSE, 0, 0);
         }
         return;
+    }
+
+    // Audio-tracks picker captures navigation keys while open — Up/Down
+    // move the highlight, Enter applies. Handle this before falling
+    // into the general transport switch so the keys don't also trigger
+    // their usual volume/fullscreen bindings.
+    if (audio_tracks_overlay_.visible()) {
+        if (vk == VK_UP) {
+            audio_tracks_overlay_.move_highlight(-1);
+            transport_overlay_.bump_activity();
+            return;
+        }
+        if (vk == VK_DOWN) {
+            audio_tracks_overlay_.move_highlight(+1);
+            transport_overlay_.bump_activity();
+            return;
+        }
+        if (vk == VK_RETURN) {
+            if (!repeat) {
+                const int idx =
+                    audio_tracks_overlay_.highlighted_stream_index();
+                if (idx >= 0 && playback_ != nullptr) {
+                    (void)playback_->change_audio_track(idx);
+                }
+                audio_tracks_overlay_.hide();
+                transport_overlay_.bump_activity();
+            }
+            return;
+        }
+        if (vk == 'A') {
+            if (!repeat) {
+                audio_tracks_overlay_.hide();
+                transport_overlay_.bump_activity();
+            }
+            return;
+        }
+        // Any other key falls through to the normal handler below.
     }
 
     // Playlist edit keys — only active when the panel is visible so
@@ -565,6 +610,12 @@ void MainWindow::on_keydown(WPARAM vk, bool repeat) noexcept
         case 'S':
             if (!repeat) {
                 subtitle_setup_overlay_.toggle_visible();
+                transport_overlay_.bump_activity();
+            }
+            break;
+        case 'A':
+            if (!repeat) {
+                audio_tracks_overlay_.toggle_visible();
                 transport_overlay_.bump_activity();
             }
             break;
