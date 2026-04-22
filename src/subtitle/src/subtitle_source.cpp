@@ -831,6 +831,247 @@ std::string strip_html(const std::string& in) noexcept
     return packed;
 }
 
+// ---------------------------------------------------------------------------
+// SAMI multi-language support. Files commonly declare per-language
+// caption classes in a <STYLE> block (".ENCC", ".KRCC", …) and use
+// `<P Class="X">...` inside each <SYNC> to emit one line per
+// language. Extracting them into separate tracks lets the user pick
+// from the subtitle setup panel like any other track.
+
+struct SamiClassInfo {
+    std::string id;    // raw class selector without the leading dot
+    std::string name;  // Name: attribute ("English", "한국어", ...)
+    std::string lang;  // lang: attribute (ISO BCP-47-ish)
+};
+
+std::vector<SamiClassInfo> find_sami_classes(const std::string& src) noexcept
+{
+    std::string lower;
+    lower.resize(src.size());
+    std::transform(src.begin(), src.end(), lower.begin(),
+        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+
+    const std::size_t style_open = lower.find("<style");
+    if (style_open == std::string::npos) return {};
+    const std::size_t style_open_end = lower.find('>', style_open);
+    if (style_open_end == std::string::npos) return {};
+    std::size_t style_close = lower.find("</style>", style_open_end);
+    if (style_close == std::string::npos) {
+        style_close = lower.size();
+    }
+
+    std::vector<SamiClassInfo> out;
+    std::size_t i = style_open_end + 1;
+    while (i < style_close) {
+        const std::size_t dot = lower.find('.', i);
+        if (dot == std::string::npos || dot >= style_close) break;
+        // Only `.` preceded by whitespace / punctuation is a class
+        // selector — otherwise `0.5pt` style decimal values trip us.
+        if (dot > 0) {
+            const char prev = src[dot - 1];
+            if (prev != ' ' && prev != '\t' && prev != '\n'
+                && prev != '\r' && prev != '{' && prev != '}'
+                && prev != ';' && prev != ',') {
+                i = dot + 1;
+                continue;
+            }
+        }
+        std::size_t name_end = dot + 1;
+        while (name_end < style_close) {
+            const char c = src[name_end];
+            if (!std::isalnum(static_cast<unsigned char>(c))
+                && c != '_' && c != '-') break;
+            ++name_end;
+        }
+        if (name_end == dot + 1) { i = dot + 1; continue; }
+        std::string class_id(src.data() + dot + 1, name_end - dot - 1);
+
+        std::size_t j = name_end;
+        while (j < style_close
+               && (src[j] == ' ' || src[j] == '\t'
+                   || src[j] == '\n' || src[j] == '\r')) {
+            ++j;
+        }
+        if (j >= style_close || src[j] != '{') {
+            i = name_end;
+            continue;
+        }
+        const std::size_t body_start = j + 1;
+        const std::size_t body_end = src.find('}', body_start);
+        if (body_end == std::string::npos || body_end > style_close) break;
+
+        const std::string body(
+            src.data() + body_start, body_end - body_start);
+        std::string body_lower;
+        body_lower.resize(body.size());
+        std::transform(body.begin(), body.end(), body_lower.begin(),
+            [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+
+        auto extract = [&](const char* prop) -> std::string {
+            const std::size_t plen = std::strlen(prop);
+            std::size_t pos = 0;
+            while ((pos = body_lower.find(prop, pos)) != std::string::npos) {
+                if (pos > 0) {
+                    const char p = body_lower[pos - 1];
+                    if (p != ' ' && p != '\t' && p != '\n'
+                        && p != '\r' && p != ';' && p != '{') {
+                        ++pos;
+                        continue;
+                    }
+                }
+                std::size_t colon = pos + plen;
+                while (colon < body_lower.size()
+                       && (body_lower[colon] == ' '
+                           || body_lower[colon] == '\t')) {
+                    ++colon;
+                }
+                if (colon >= body_lower.size()
+                    || body_lower[colon] != ':') {
+                    ++pos;
+                    continue;
+                }
+                std::size_t v = colon + 1;
+                while (v < body.size()
+                       && (body[v] == ' ' || body[v] == '\t')) ++v;
+                std::size_t ve = v;
+                while (ve < body.size()
+                       && body[ve] != ';' && body[ve] != '\n'
+                       && body[ve] != '\r') ++ve;
+                while (ve > v
+                       && (body[ve - 1] == ' '
+                           || body[ve - 1] == '\t')) --ve;
+                return body.substr(v, ve - v);
+            }
+            return {};
+        };
+
+        SamiClassInfo info;
+        info.id   = std::move(class_id);
+        info.name = extract("name");
+        info.lang = extract("lang");
+        // Without either attribute this is just a generic style rule
+        // (font, colour, margins). Skip — we'd otherwise surface
+        // things like `.normal` as a fake language track.
+        if (!info.name.empty() || !info.lang.empty()) {
+            out.push_back(std::move(info));
+        }
+        i = body_end + 1;
+    }
+    return out;
+}
+
+bool sami_match_ci(const std::string& s, std::size_t pos,
+                   const char* needle, std::size_t nlen) noexcept
+{
+    if (pos + nlen > s.size()) return false;
+    for (std::size_t k = 0; k < nlen; ++k) {
+        const char a = s[pos + k];
+        const char b = needle[k];
+        if (std::tolower(static_cast<unsigned char>(a))
+            != std::tolower(static_cast<unsigned char>(b))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool is_p_open_at(const std::string& s, std::size_t pos) noexcept
+{
+    if (pos + 2 > s.size()) return false;
+    if (s[pos] != '<') return false;
+    const char c1 = s[pos + 1];
+    if (c1 != 'p' && c1 != 'P') return false;
+    if (pos + 2 >= s.size()) return true;
+    const char c2 = s[pos + 2];
+    return !std::isalnum(static_cast<unsigned char>(c2))
+        && c2 != '-' && c2 != '_';
+}
+
+bool is_p_close_at(const std::string& s, std::size_t pos) noexcept
+{
+    if (pos + 3 > s.size()) return false;
+    if (s[pos] != '<' || s[pos + 1] != '/') return false;
+    const char c = s[pos + 2];
+    if (c != 'p' && c != 'P') return false;
+    if (pos + 3 >= s.size()) return true;
+    const char after = s[pos + 3];
+    return !std::isalnum(static_cast<unsigned char>(after))
+        && after != '-' && after != '_';
+}
+
+bool is_sync_open_at(const std::string& s, std::size_t pos) noexcept
+{
+    return sami_match_ci(s, pos, "<sync", 5);
+}
+
+// Remove every `<P ...>...` block whose `Class=` attribute doesn't
+// match `target_class`. Block boundaries are the next `<P>`,
+// `</P>`, or `<SYNC>`; SAMI authors routinely omit the `</P>`
+// closer so we can't rely on it alone. Non-P content (including
+// `<SYNC>` tags themselves) is kept verbatim so
+// `convert_smi_to_ass` still sees the timing scaffolding it needs.
+std::string sami_keep_only_class(
+    const std::string& src, const std::string& target_class) noexcept
+{
+    std::string target_upper;
+    target_upper.reserve(target_class.size());
+    for (char c : target_class) {
+        target_upper.push_back(static_cast<char>(
+            std::toupper(static_cast<unsigned char>(c))));
+    }
+
+    std::string out;
+    out.reserve(src.size());
+
+    std::size_t i = 0;
+    while (i < src.size()) {
+        std::size_t p_start = std::string::npos;
+        for (std::size_t j = i; j < src.size(); ++j) {
+            if (src[j] == '<' && is_p_open_at(src, j)) {
+                p_start = j;
+                break;
+            }
+        }
+        if (p_start == std::string::npos) {
+            out.append(src, i, src.size() - i);
+            break;
+        }
+        out.append(src, i, p_start - i);
+
+        const std::size_t tag_end = src.find('>', p_start);
+        if (tag_end == std::string::npos) {
+            out.append(src, p_start, src.size() - p_start);
+            break;
+        }
+        const std::string tag_body(
+            src.data() + p_start + 2, tag_end - p_start - 2);
+        const std::string class_val = find_attr(tag_body, "class");
+        std::string class_upper;
+        class_upper.reserve(class_val.size());
+        for (char c : class_val) {
+            class_upper.push_back(static_cast<char>(
+                std::toupper(static_cast<unsigned char>(c))));
+        }
+
+        std::size_t p_end = tag_end + 1;
+        while (p_end < src.size()) {
+            if (src[p_end] == '<'
+                && (is_p_open_at(src, p_end)
+                    || is_p_close_at(src, p_end)
+                    || is_sync_open_at(src, p_end))) {
+                break;
+            }
+            ++p_end;
+        }
+
+        if (class_upper == target_upper) {
+            out.append(src, p_start, p_end - p_start);
+        }
+        i = p_end;
+    }
+    return out;
+}
+
 std::string convert_smi_to_ass(const std::string& src_in) noexcept
 {
     std::string src = src_in;
@@ -918,6 +1159,94 @@ std::string convert_smi_to_ass(const std::string& src_in) noexcept
 bool looks_like_subtitle_path(const std::wstring& path) noexcept
 {
     return guess_format(path) != Format::Unknown;
+}
+
+std::vector<SamiLanguageTrack> parse_sami_language_tracks(
+    const std::wstring& path, const std::string& forced_encoding) noexcept
+{
+    std::vector<SamiLanguageTrack> out;
+
+    if (guess_format(path) != Format::Smi) {
+        return out;
+    }
+
+    std::string bytes;
+    if (!read_file_bytes(path, bytes)) {
+        return out;
+    }
+
+    // Mirror `open()`'s encoding handling so the forced-encoding
+    // cycle stays consistent between the single-track and multi-
+    // track paths.
+    const EncodingSpec spec = resolve_encoding(forced_encoding);
+    switch (spec.kind) {
+    case EncodingSpec::Kind::Auto:
+        (void)normalize_to_utf8(bytes);
+        break;
+    case EncodingSpec::Kind::Utf8:
+        if (bytes.size() >= 3
+            && static_cast<unsigned char>(bytes[0]) == 0xEF
+            && static_cast<unsigned char>(bytes[1]) == 0xBB
+            && static_cast<unsigned char>(bytes[2]) == 0xBF) {
+            bytes.erase(0, 3);
+        }
+        break;
+    case EncodingSpec::Kind::Utf16Le: {
+        std::size_t off = 0;
+        if (bytes.size() >= 2
+            && static_cast<unsigned char>(bytes[0]) == 0xFF
+            && static_cast<unsigned char>(bytes[1]) == 0xFE) {
+            off = 2;
+        }
+        bytes = decode_utf16le(bytes.data() + off, bytes.size() - off);
+        break;
+    }
+    case EncodingSpec::Kind::Utf16Be: {
+        std::size_t off = 0;
+        if (bytes.size() >= 2
+            && static_cast<unsigned char>(bytes[0]) == 0xFE
+            && static_cast<unsigned char>(bytes[1]) == 0xFF) {
+            off = 2;
+        }
+        bytes = decode_utf16be(bytes.data() + off, bytes.size() - off);
+        break;
+    }
+    case EncodingSpec::Kind::Codepage:
+        if (!decode_with_codepage(bytes, spec.codepage)) {
+            (void)normalize_to_utf8(bytes);
+        }
+        break;
+    }
+
+    const auto classes = find_sami_classes(bytes);
+    if (classes.size() < 2) {
+        return out;
+    }
+
+    out.reserve(classes.size());
+    for (const auto& cl : classes) {
+        const std::string filtered = sami_keep_only_class(bytes, cl.id);
+        std::string ass = convert_smi_to_ass(filtered);
+
+        SamiLanguageTrack t;
+        t.class_id = cl.id;
+        try {
+            if (!cl.name.empty()) {
+                t.display_name = utf8_to_wide(cl.name);
+            } else if (!cl.lang.empty()) {
+                t.display_name = utf8_to_wide(cl.lang);
+            } else {
+                t.display_name = utf8_to_wide(cl.id);
+            }
+        } catch (...) {
+            t.display_name = utf8_to_wide(cl.id);
+        }
+        t.ass_content = std::move(ass);
+        out.push_back(std::move(t));
+    }
+
+    log::info("subtitle: SAMI split into {} language tracks", out.size());
+    return out;
 }
 
 // ---------------------------------------------------------------------------

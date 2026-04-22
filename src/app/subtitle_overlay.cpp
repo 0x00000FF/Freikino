@@ -126,46 +126,94 @@ void SubtitleOverlay::sync_embedded_tracks() noexcept
 
 bool SubtitleOverlay::load(const std::wstring& path)
 {
-    // Find (or create) the single external slot; kept as tracks_[0]
-    // by convention so `current_name()` and the encoding-reload path
-    // can reach it without a linear search.
-    Track* slot = external_track();
-    if (slot == nullptr) {
-        auto t = std::make_unique<Track>();
-        t->external  = true;
-        t->available = true;
-        tracks_.insert(tracks_.begin(), std::move(t));
-        slot = tracks_.front().get();
-    }
-    if (slot->source == nullptr) {
-        slot->source = std::make_unique<subtitle::SubtitleSource>();
-    }
-    if (slot->renderer == nullptr) {
-        slot->renderer = std::make_unique<subtitle::SubtitleRenderer>();
+    // Drop every existing external track before loading the new file.
+    // SAMI files can expand into several tracks at once (one per
+    // language class) so a single-slot "reuse" doesn't fit here; a
+    // uniform wipe-and-rebuild is simpler and correct for both the
+    // single-track and multi-track paths.
+    tracks_.erase(
+        std::remove_if(
+            tracks_.begin(), tracks_.end(),
+            [](const std::unique_ptr<Track>& t) {
+                return t && t->external;
+            }),
+        tracks_.end());
+
+    const auto slash    = path.find_last_of(L"\\/");
+    const std::wstring basename =
+        (slash == std::wstring::npos) ? path : path.substr(slash + 1);
+
+    // ---- SAMI multi-language fast path ----
+    // Only fires when the file actually declares >= 2 language
+    // classes in its <STYLE> block. For single-language SAMI (or
+    // non-SAMI) the helper returns an empty vector and we fall
+    // through to the regular load.
+    const auto sami = subtitle::parse_sami_language_tracks(
+        path, forced_encoding_);
+    if (!sami.empty()) {
+        std::size_t inserted = 0;
+        for (std::size_t idx = 0; idx < sami.size(); ++idx) {
+            const auto& entry = sami[idx];
+            auto t = std::make_unique<Track>();
+            t->external  = true;
+            t->available = true;
+            t->source    = std::make_unique<subtitle::SubtitleSource>();
+            t->renderer  = std::make_unique<subtitle::SubtitleRenderer>();
+            const std::wstring display =
+                basename + L" (" + entry.display_name + L")";
+            if (!t->source->open_from_memory(
+                    std::string(entry.ass_content), display)) {
+                continue;
+            }
+            t->renderer->set_source(t->source.get());
+            t->ever_loaded = true;
+            t->label       = display;
+            // First class is activated by default — users can toggle
+            // the rest from the S panel. Activating all of them by
+            // default would stack captions on top of each other for
+            // people who only want one language.
+            t->active      = (inserted == 0);
+            t->cache_dirty = true;
+            apply_settings(*t);
+            tracks_.insert(tracks_.begin() + inserted, std::move(t));
+            ++inserted;
+        }
+        if (inserted == 0) {
+            external_path_.clear();
+            active_display_name_.clear();
+            return false;
+        }
+        external_path_ = path;
+        for (const auto& t : tracks_) {
+            if (t && t->external && t->active) {
+                active_display_name_ = t->label;
+                break;
+            }
+        }
+        return true;
     }
 
-    if (!slot->source->open(path, forced_encoding_)) {
-        slot->renderer->set_source(nullptr);
-        slot->ever_loaded = false;
-        slot->active      = false;
-        slot->label.clear();
+    // ---- Regular single-track load ----
+    auto t = std::make_unique<Track>();
+    t->external  = true;
+    t->available = true;
+    t->source    = std::make_unique<subtitle::SubtitleSource>();
+    t->renderer  = std::make_unique<subtitle::SubtitleRenderer>();
+    if (!t->source->open(path, forced_encoding_)) {
         external_path_.clear();
         active_display_name_.clear();
         return false;
     }
-    slot->renderer->set_source(slot->source.get());
-    slot->ever_loaded   = true;
-    slot->active        = true;
-    slot->cache_dirty   = true;
-    slot->cache.clear();
-    slot->images.clear();
+    t->renderer->set_source(t->source.get());
+    t->ever_loaded = true;
+    t->active      = true;
+    t->cache_dirty = true;
+    t->label       = basename;
+    apply_settings(*t);
+    tracks_.insert(tracks_.begin(), std::move(t));
 
-    const auto slash = path.find_last_of(L"\\/");
-    slot->label = (slash == std::wstring::npos) ? path : path.substr(slash + 1);
     external_path_       = path;
-    active_display_name_ = slot->label;
-
-    apply_settings(*slot);
+    active_display_name_ = basename;
     return true;
 }
 

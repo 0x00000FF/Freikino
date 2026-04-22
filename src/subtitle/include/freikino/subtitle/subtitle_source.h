@@ -2,6 +2,7 @@
 
 #include <memory>
 #include <string>
+#include <vector>
 
 // Forward-declare libass types so consumers don't need ass.h.
 extern "C" {
@@ -75,5 +76,27 @@ private:
 // for .srt/.smi/.sami/.ass/.ssa (case-insensitive). The actual open
 // path still parses the file to confirm format.
 [[nodiscard]] bool looks_like_subtitle_path(const std::wstring& path) noexcept;
+
+// One per-language entry extracted from a multi-language SAMI file.
+// `ass_content` is a self-contained ASS document ready to hand to
+// `SubtitleSource::open_from_memory`; `display_name` is the `Name:`
+// attribute from the SAMI <STYLE> rule (falls back to the class id).
+struct SamiLanguageTrack {
+    std::string  class_id;
+    std::wstring display_name;
+    std::string  ass_content;
+};
+
+// Try to split a SAMI file into per-language tracks. Returns an
+// empty vector if the file isn't SAMI, has no <STYLE> classes, or
+// has fewer than two language classes — in which case the caller
+// should fall back to the normal single-track `SubtitleSource::open`.
+//
+// The same encoding-detection / forced-encoding path as `open()` is
+// used on the raw bytes before the <STYLE> block is searched, so the
+// E-key encoding cycle carries through to the multi-track path.
+[[nodiscard]] std::vector<SamiLanguageTrack> parse_sami_language_tracks(
+    const std::wstring& path,
+    const std::string& forced_encoding = {}) noexcept;
 
 } // namespace freikino::subtitle
