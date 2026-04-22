@@ -194,25 +194,29 @@ TransportOverlay::compute_layout(UINT w, UINT h) const noexcept
     l.stop_center        = D2D1::Point2F(
         (l.stop_button.left + l.stop_button.right) * 0.5f, row_y);
 
-    l.time_text.right  = fw - kEdgePad;
-    l.time_text.left   = fw - kEdgePad - kTimeWidth;
-    l.time_text.top    = row_y - 12.0f;
-    l.time_text.bottom = row_y + 12.0f;
+    // Right-edge cluster, laid out in left-to-right reading order:
+    //     [ current / total ]  [ volume ]  [ fullscreen ]
+    // Built right-to-left in pixel space since the window's right
+    // edge is the anchor — fullscreen sits at the far right, then
+    // the speaker, then the time readout to its left.
+    l.fs_button.right  = fw - kEdgePad;
+    l.fs_button.left   = l.fs_button.right - kBtnSize;
+    l.fs_button.top    = row_y - kBtnSize * 0.5f;
+    l.fs_button.bottom = row_y + kBtnSize * 0.5f;
+    l.fs_center        = D2D1::Point2F(
+        (l.fs_button.left + l.fs_button.right) * 0.5f, row_y);
 
-    l.volume_button.right  = l.time_text.left - 8.0f;
+    l.volume_button.right  = l.fs_button.left - kBtnGap;
     l.volume_button.left   = l.volume_button.right - kBtnSize;
     l.volume_button.top    = row_y - kBtnSize * 0.5f;
     l.volume_button.bottom = row_y + kBtnSize * 0.5f;
     l.volume_center        = D2D1::Point2F(
         (l.volume_button.left + l.volume_button.right) * 0.5f, row_y);
 
-    // Fullscreen button sits directly left of the speaker.
-    l.fs_button.right  = l.volume_button.left - kBtnGap;
-    l.fs_button.left   = l.fs_button.right - kBtnSize;
-    l.fs_button.top    = row_y - kBtnSize * 0.5f;
-    l.fs_button.bottom = row_y + kBtnSize * 0.5f;
-    l.fs_center        = D2D1::Point2F(
-        (l.fs_button.left + l.fs_button.right) * 0.5f, row_y);
+    l.time_text.right  = l.volume_button.left - 8.0f;
+    l.time_text.left   = l.time_text.right - kTimeWidth;
+    l.time_text.top    = row_y - 12.0f;
+    l.time_text.bottom = row_y + 12.0f;
 
     // Vertical popup slider centred above the speaker.
     l.volume_popup_panel.left   = l.volume_center.x - kVolPopupW * 0.5f;
@@ -239,7 +243,11 @@ TransportOverlay::compute_layout(UINT w, UINT h) const noexcept
     l.volume_slider_track.bottom = l.volume_slider_y1;
 
     l.seek_x0 = l.stop_button.right + kSeekGap;
-    l.seek_x1 = l.fs_button.left    - kSeekGap;
+    // The right cluster starts at the time readout (leftmost of
+    // time / volume / fullscreen), so the scrub bar ends just before
+    // it — not before the fullscreen button, which now sits at the
+    // far right after the right-cluster reorder.
+    l.seek_x1 = l.time_text.left    - kSeekGap;
     l.seek_y  = row_y;
     if (l.seek_x1 < l.seek_x0 + 40.0f) {
         // Too narrow for a scrub bar; collapse the hit region.
