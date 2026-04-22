@@ -50,6 +50,7 @@ you're watching to the rest of your system. Relevant concretely:
 | Key    | Action                                     |
 | ------ | ------------------------------------------ |
 | `L`    | Toggle playlist panel                      |
+| `S`    | Toggle subtitle setup panel                |
 | `P`    | Toggle incognito mode                      |
 | `F3`   | Toggle debug overlay (FPS / queues / etc.) |
 
@@ -63,7 +64,21 @@ you're watching to the rest of your system. Relevant concretely:
 
 ### Subtitles
 Drop a `.srt`, `.smi`, `.sami`, `.ass`, or `.ssa` file on the player while
-something is playing. The subtitle track applies to the current video.
+something is playing and the track applies to the current video. Rendered
+via libass above the transport bar so the scrub/buttons never overlap the
+caption.
+
+With the subtitle setup panel open (`S`):
+
+| Key     | Action                                                      |
+| ------- | ----------------------------------------------------------- |
+| `,`     | Subtitle delay −100 ms                                      |
+| `.`     | Subtitle delay +100 ms                                      |
+| `0`     | Reset subtitle delay                                        |
+| `-`     | Shrink subtitle font                                        |
+| `=`     | Grow subtitle font                                          |
+| `E`     | Cycle forced encoding (auto → UTF-8 → UTF-16LE/BE → CP949/932/936/1252) |
+| `F`     | Pick a subtitle font (system font dialog; useful for CJK)   |
 
 ## Goals
 
