@@ -82,6 +82,9 @@ constexpr int kTransportBarHeightPx = 96;
 // on the last-drawn frame without a timer to tick the presenter.
 constexpr UINT_PTR kSizeMoveTimerId = 0x2B01;
 
+// Icon resource id — must match `101 ICON ...` in resources/freikino.rc.
+constexpr int kAppIconId = 101;
+
 } // namespace
 
 // Private window message used by MediaSession's background open
@@ -113,6 +116,15 @@ void MainWindow::create(HINSTANCE instance)
     p.title      = kTitle;
     p.style      = WS_OVERLAPPEDWINDOW;
     p.background = nullptr;
+
+    // Window-class icon. LoadIconW with an instance handle + numeric
+    // id pulls the icon from our own resources (see freikino.rc).
+    // Using the same handle for big + small lets Windows pick the
+    // closest-size image embedded in the .ico; we ship a
+    // multi-resolution icon so that produces crisp 16x16 taskbar
+    // glyphs and full-size alt-tab renderings from one file.
+    p.icon       = ::LoadIconW(instance, MAKEINTRESOURCEW(kAppIconId));
+    p.small_icon = p.icon;
 
     const UINT dpi = ::GetDpiForSystem();
     p.width  = platform::scale(kDesignWidth,  dpi);
@@ -1669,11 +1681,18 @@ void MainWindow::apply_incognito_icon() noexcept
         // On toggle-off, WM_SETICON NULL is not enough: once the
         // taskbar has latched onto an explicit HICON it keeps
         // showing it instead of falling back to the class icon.
-        // Install IDI_APPLICATION explicitly to force a refresh —
-        // that matches what the taskbar would show pre-incognito
-        // (our window class has no icon of its own). These are
-        // shared system icons so they must not be DestroyIcon'd.
-        new_big   = ::LoadIconW(nullptr, IDI_APPLICATION);
+        // Load our own app icon from the embedded resource — that's
+        // what the taskbar would show pre-incognito anyway now that
+        // the window class has a real icon. Shared handle (no
+        // DestroyIcon) since LoadIconW on a resource id returns a
+        // shared cache entry.
+        HINSTANCE inst =
+            reinterpret_cast<HINSTANCE>(
+                ::GetWindowLongPtrW(handle(), GWLP_HINSTANCE));
+        new_big = ::LoadIconW(inst, MAKEINTRESOURCEW(kAppIconId));
+        if (new_big == nullptr) {
+            new_big = ::LoadIconW(nullptr, IDI_APPLICATION);
+        }
         new_small = new_big;
     }
 

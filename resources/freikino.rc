@@ -5,6 +5,10 @@
 // preprocessor configurations.
 1 RT_MANIFEST "freikino.manifest"
 
+// Integer ID is shared with main_window.cpp (`kAppIconId`); kept numeric
+// so we don't have to introduce a resource-id header for a single entry.
+101 ICON "freikino.ico"
+
 VS_VERSION_INFO VERSIONINFO
  FILEVERSION    0,1,0,0
  PRODUCTVERSION 0,1,0,0
