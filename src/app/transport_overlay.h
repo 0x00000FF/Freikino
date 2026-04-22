@@ -69,8 +69,15 @@ public:
     // appropriately.
     [[nodiscard]] bool wants_mouse_capture() const noexcept
     {
-        return seek_dragging_ || volume_dragging_;
+        return seek_dragging_ || volume_dragging_
+            || press_btn_ != PressBtn::None;
     }
+
+    // True if the given point is over any interactive region of the
+    // transport bar (buttons or scrub track). Used by MainWindow's
+    // WM_SETCURSOR handler to swap in the hand cursor.
+    [[nodiscard]] bool hit_interactive(int x, int y,
+                                       UINT width, UINT height) const noexcept;
 
     // Public hook so the message window can keep the bar visible on
     // non-mouse activity (volume keys, pause toggle, etc.).
@@ -138,17 +145,30 @@ private:
     // in the cursor x as the midpoint.
     ComPtr<IDWriteTextFormat>    text_thumb_time_;
 
+    // Which button (if any) is currently captured by mouse-down.
+    // Seek + volume drags have their own drag flags, but buttons
+    // that fire on click go through this state so we can render a
+    // "pressed" visual and fire-on-release semantics.
+    enum class PressBtn {
+        None,
+        Play,
+        Stop,
+        Fullscreen,
+        Volume,
+    };
+
     // Input state.
-    int   mouse_x_         = -1;
-    int   mouse_y_         = -1;
-    bool  hover_play_      = false;
-    bool  hover_stop_      = false;
-    bool  hover_fs_        = false;
-    bool  hover_seek_      = false;
-    bool  hover_volume_    = false;   // over speaker OR popup panel
-    bool  volume_dragging_ = false;   // mouse-down inside slider track
-    bool  seek_dragging_   = false;
-    float drag_progress_   = 0.0f;
+    int      mouse_x_         = -1;
+    int      mouse_y_         = -1;
+    bool     hover_play_      = false;
+    bool     hover_stop_      = false;
+    bool     hover_fs_        = false;
+    bool     hover_seek_      = false;
+    bool     hover_volume_    = false;   // over speaker OR popup panel
+    bool     volume_dragging_ = false;   // mouse-down inside slider track
+    bool     seek_dragging_   = false;
+    PressBtn press_btn_       = PressBtn::None;
+    float    drag_progress_   = 0.0f;
 
     FullscreenToggleFn fs_toggle_      = nullptr;
     void*              fs_toggle_user_ = nullptr;

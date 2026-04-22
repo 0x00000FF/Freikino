@@ -363,36 +363,20 @@ void TransportOverlay::on_lbutton_down(int x, int y, UINT w, UINT h) noexcept
     }
     const Layout l = compute_layout(w, h);
 
+    // Buttons fire on release (mouse-up still over the same button).
+    // On press we just arm `press_btn_` so the draw path can paint a
+    // pressed visual. This matches standard Windows button UX — the
+    // user can drift off and release to cancel.
     if (hit(l.play_button, x, y)) {
-        try {
-            playback_->toggle_pause();
-        } catch (const std::exception& e) {
-            log::error("transport play click: {}", e.what());
-        } catch (...) {
-            log::error("transport play click: unknown");
-        }
+        press_btn_ = PressBtn::Play;
         return;
     }
-
     if (hit(l.stop_button, x, y)) {
-        try {
-            playback_->stop();
-        } catch (const std::exception& e) {
-            log::error("transport stop click: {}", e.what());
-        } catch (...) {
-            log::error("transport stop click: unknown");
-        }
+        press_btn_ = PressBtn::Stop;
         return;
     }
-
     if (hit(l.fs_button, x, y)) {
-        if (fs_toggle_ != nullptr) {
-            try {
-                fs_toggle_(fs_toggle_user_);
-            } catch (...) {
-                log::error("transport fs click: unknown");
-            }
-        }
+        press_btn_ = PressBtn::Fullscreen;
         return;
     }
 
@@ -413,15 +397,10 @@ void TransportOverlay::on_lbutton_down(int x, int y, UINT w, UINT h) noexcept
         return;
     }
 
-    // Click on the speaker itself toggles mute.
+    // Click on the speaker itself toggles mute — arm press state;
+    // action fires on release.
     if (hit(l.volume_button, x, y)) {
-        try {
-            playback_->toggle_mute();
-        } catch (const std::exception& e) {
-            log::error("transport mute click: {}", e.what());
-        } catch (...) {
-            log::error("transport mute click: unknown");
-        }
+        press_btn_ = PressBtn::Volume;
         return;
     }
 
@@ -435,6 +414,39 @@ void TransportOverlay::on_lbutton_up(int x, int y, UINT w, UINT h) noexcept
 {
     (void)y; // lift is along the x-axis on the scrub bar
     last_activity_ms_ = ::GetTickCount64();
+
+    // Fire the armed button action if release is still over the same
+    // button. Release-outside cancels silently — standard button UX.
+    const PressBtn pressed = press_btn_;
+    press_btn_ = PressBtn::None;
+    if (pressed != PressBtn::None && playback_ != nullptr) {
+        const Layout l = compute_layout(w, h);
+        try {
+            switch (pressed) {
+            case PressBtn::Play:
+                if (hit(l.play_button, x, y)) playback_->toggle_pause();
+                break;
+            case PressBtn::Stop:
+                if (hit(l.stop_button, x, y)) playback_->stop();
+                break;
+            case PressBtn::Fullscreen:
+                if (hit(l.fs_button, x, y) && fs_toggle_ != nullptr) {
+                    fs_toggle_(fs_toggle_user_);
+                }
+                break;
+            case PressBtn::Volume:
+                if (hit(l.volume_button, x, y)) playback_->toggle_mute();
+                break;
+            default:
+                break;
+            }
+        } catch (const std::exception& e) {
+            log::error("transport button release: {}", e.what());
+        } catch (...) {
+            log::error("transport button release: unknown");
+        }
+    }
+
     if (seek_dragging_ && playback_ != nullptr) {
         const Layout l = compute_layout(w, h);
         const float  t = position_on_bar(x, l);
@@ -455,11 +467,34 @@ void TransportOverlay::on_lbutton_up(int x, int y, UINT w, UINT h) noexcept
     volume_dragging_ = false;
 }
 
+bool TransportOverlay::hit_interactive(
+    int x, int y, UINT w, UINT h) const noexcept
+{
+    // Only report true while the bar is at least partially visible —
+    // otherwise the hand cursor would flicker over the video area
+    // whenever the cursor crossed a now-invisible button rect.
+    if (alpha_ <= 0.05f) {
+        return false;
+    }
+    const Layout l = compute_layout(w, h);
+    if (hit(l.play_button, x, y))   return true;
+    if (hit(l.stop_button, x, y))   return true;
+    if (hit(l.fs_button, x, y))     return true;
+    if (hit(l.volume_button, x, y)) return true;
+    // Volume popup slider — only active while the popup is showing.
+    if ((hover_volume_ || volume_dragging_)
+        && hit(l.volume_popup_panel, x, y)) {
+        return true;
+    }
+    if (hit(l.seek_hit, x, y))      return true;
+    return false;
+}
+
 void TransportOverlay::on_mouse_leave() noexcept
 {
     // Don't drop drag state on mouse-leave — SetCapture keeps tracking even
     // when the cursor exits the window.
-    if (!seek_dragging_ && !volume_dragging_) {
+    if (!seek_dragging_ && !volume_dragging_ && press_btn_ == PressBtn::None) {
         mouse_x_      = -1;
         mouse_y_      = -1;
         hover_play_   = false;
@@ -570,7 +605,34 @@ void TransportOverlay::draw(ID2D1DeviceContext* ctx, UINT w, UINT h) noexcept
         }
     }
 
+    // Shared helper — paints a subtle rounded-rect behind a button
+    // for hover / pressed feedback. "Pressed" requires both
+    // press_btn_ == this button AND the cursor still on it, matching
+    // Windows' standard button feel: drift off cancels the visual
+    // even though the click remains armed until release.
+    auto draw_btn_bg = [&](const D2D1_RECT_F& rect, bool hover, bool pressed) {
+        if (!hover && !pressed) return;
+        const float tint = pressed ? 0.25f : 0.12f;
+        brush_track_->SetOpacity(alpha_ * tint);
+        D2D1_ROUNDED_RECT rr{};
+        rr.rect    = rect;
+        rr.radiusX = 8.0f;
+        rr.radiusY = 8.0f;
+        ctx->FillRoundedRectangle(rr, brush_track_.Get());
+    };
+
+    const bool play_pressed = press_btn_ == PressBtn::Play && hover_play_;
+    const bool stop_pressed = press_btn_ == PressBtn::Stop && hover_stop_;
+    const bool fs_pressed   = press_btn_ == PressBtn::Fullscreen && hover_fs_;
+    // For the speaker icon, only the icon itself counts as "pressed"
+    // (hover_volume_ is sticky across the popup).
+    const bool speaker_hover =
+        mouse_x_ >= 0 && mouse_y_ >= 0 && hit(l.volume_button, mouse_x_, mouse_y_);
+    const bool volume_pressed =
+        press_btn_ == PressBtn::Volume && speaker_hover;
+
     // 4. Play / pause glyph.
+    draw_btn_bg(l.play_button, hover_play_, play_pressed);
     brush_icon_->SetOpacity(alpha_ * (hover_play_ ? 1.0f : 0.85f));
 
     if (is_paused()) {
@@ -602,6 +664,7 @@ void TransportOverlay::draw(ID2D1DeviceContext* ctx, UINT w, UINT h) noexcept
     }
 
     // 4b. Stop glyph — a filled square.
+    draw_btn_bg(l.stop_button, hover_stop_, stop_pressed);
     brush_icon_->SetOpacity(alpha_ * (hover_stop_ ? 1.0f : 0.85f));
     {
         const float sq = 14.0f;
@@ -617,6 +680,7 @@ void TransportOverlay::draw(ID2D1DeviceContext* ctx, UINT w, UINT h) noexcept
     // 4c. Fullscreen glyph — four L-shaped corner brackets pointing
     //     outward (enter FS). We don't track FS state here so the
     //     icon stays constant in both states; the action toggles.
+    draw_btn_bg(l.fs_button, hover_fs_, fs_pressed);
     brush_icon_->SetOpacity(alpha_ * (hover_fs_ ? 1.0f : 0.85f));
     {
         const float cx = l.fs_center.x;
@@ -651,6 +715,7 @@ void TransportOverlay::draw(ID2D1DeviceContext* ctx, UINT w, UINT h) noexcept
     //    bars to the right that represent sound waves. When muted we
     //    draw a single diagonal line across the cone instead.
     const bool muted = playback_ != nullptr && playback_->muted();
+    draw_btn_bg(l.volume_button, speaker_hover, volume_pressed);
     brush_icon_->SetOpacity(alpha_ * (hover_volume_ ? 1.0f : 0.85f));
     {
         const float cx = l.volume_center.x;

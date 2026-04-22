@@ -320,20 +320,25 @@ LRESULT MainWindow::on_message(UINT msg, WPARAM wparam, LPARAM lparam)
         return on_nchittest(lparam);
 
     case WM_SETCURSOR: {
-        // Swap to the east-west arrow over the playlist resize grip.
-        // Default handling elsewhere.
+        // Swap cursor for interactive regions:
+        //   - Hand (IDC_HAND) over transport buttons + scrub track.
+        //   - East-west arrow over the playlist resize grip.
+        // Everything else falls through to default handling.
         if (reinterpret_cast<HWND>(wparam) == handle()
             && LOWORD(lparam) == HTCLIENT) {
             POINT pt{};
+            RECT rc{};
             if (::GetCursorPos(&pt)
-                && ::ScreenToClient(handle(), &pt)) {
-                RECT rc{};
-                if (::GetClientRect(handle(), &rc)
-                    && playlist_overlay_.hit_resize_grip(
-                        pt.x, pt.y,
-                        static_cast<UINT>(rc.right),
-                        static_cast<UINT>(rc.bottom))) {
+                && ::ScreenToClient(handle(), &pt)
+                && ::GetClientRect(handle(), &rc)) {
+                const UINT cw = static_cast<UINT>(rc.right);
+                const UINT ch = static_cast<UINT>(rc.bottom);
+                if (playlist_overlay_.hit_resize_grip(pt.x, pt.y, cw, ch)) {
                     ::SetCursor(::LoadCursorW(nullptr, IDC_SIZEWE));
+                    return TRUE;
+                }
+                if (transport_overlay_.hit_interactive(pt.x, pt.y, cw, ch)) {
+                    ::SetCursor(::LoadCursorW(nullptr, IDC_HAND));
                     return TRUE;
                 }
             }
