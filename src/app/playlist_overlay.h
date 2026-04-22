@@ -138,6 +138,7 @@ private:
     ComPtr<ID2D1SolidColorBrush> brush_text_dim_;
     ComPtr<IDWriteTextFormat>    text_title_;
     ComPtr<IDWriteTextFormat>    text_row_;
+    ComPtr<IDWriteTextFormat>    text_duration_;
 };
 
 } // namespace freikino::app

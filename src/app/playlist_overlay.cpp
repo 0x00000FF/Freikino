@@ -29,6 +29,27 @@ bool hit_rect(const D2D1_RECT_F& r, int x, int y) noexcept
     return fx >= r.left && fx <= r.right && fy >= r.top && fy <= r.bottom;
 }
 
+// Compact duration formatter for playlist rows. Under an hour we
+// use M:SS; at/above one hour H:MM:SS. Leading zeros are preserved
+// only for seconds — a 3-minute track reads "3:07", not "03:07".
+std::wstring format_duration_short(std::int64_t ns) noexcept
+{
+    if (ns <= 0) return {};
+    const std::int64_t total_s = ns / 1'000'000'000LL;
+    const int h = static_cast<int>(total_s / 3600);
+    const int m = static_cast<int>((total_s / 60) % 60);
+    const int s = static_cast<int>(total_s % 60);
+    wchar_t buf[16] = {};
+    int n;
+    if (h > 0) {
+        n = std::swprintf(buf, 16, L"%d:%02d:%02d", h, m, s);
+    } else {
+        n = std::swprintf(buf, 16, L"%d:%02d", m, s);
+    }
+    if (n <= 0) return {};
+    return std::wstring{buf, static_cast<std::size_t>(n)};
+}
+
 } // namespace
 
 void PlaylistOverlay::create(render::OverlayRenderer& renderer)
@@ -85,6 +106,18 @@ void PlaylistOverlay::create(render::OverlayRenderer& renderer)
     trim.delimiter   = 0;
     trim.delimiterCount = 0;
     text_row_->SetTrimming(&trim, nullptr);
+
+    check_hr(dw->CreateTextFormat(
+        L"Segoe UI", nullptr,
+        DWRITE_FONT_WEIGHT_NORMAL,
+        DWRITE_FONT_STYLE_NORMAL,
+        DWRITE_FONT_STRETCH_NORMAL,
+        12.0f,
+        L"en-us",
+        &text_duration_));
+    text_duration_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING);
+    text_duration_->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+    text_duration_->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
 }
 
 PlaylistOverlay::Layout
@@ -412,17 +445,39 @@ void PlaylistOverlay::draw(ID2D1DeviceContext* ctx, UINT w, UINT h) noexcept
             ctx->FillRectangle(inner, brush_row_selected_.Get());
         }
 
+        // Duration on the right (if known). Reserve 64 px so row
+        // titles ellipsize-trim rather than overlapping the time.
+        constexpr float kDurationColumn = 64.0f;
+        const auto& e = entries[i];
+        const std::int64_t dur_ns =
+            (playlist_ != nullptr)
+                ? playlist_->duration_ns_for(e.path) : 0;
+        std::wstring dur_str = format_duration_short(dur_ns);
+
         if (text_row_) {
             D2D1_RECT_F text_rect = row;
             text_rect.left  += kPadX;
-            text_rect.right -= kPadX;
-            const auto& e = entries[i];
+            text_rect.right -= kPadX + (dur_str.empty() ? 0.0f : kDurationColumn);
             ctx->DrawTextW(
                 e.display.c_str(),
                 static_cast<UINT32>(e.display.size()),
                 text_row_.Get(),
                 text_rect,
                 (i == cur) ? brush_text_.Get() : brush_text_dim_.Get(),
+                D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                DWRITE_MEASURING_MODE_NATURAL);
+        }
+
+        if (!dur_str.empty() && text_duration_) {
+            D2D1_RECT_F dur_rect = row;
+            dur_rect.right -= kPadX;
+            dur_rect.left   = dur_rect.right - kDurationColumn;
+            ctx->DrawTextW(
+                dur_str.c_str(),
+                static_cast<UINT32>(dur_str.size()),
+                text_duration_.Get(),
+                dur_rect,
+                brush_text_dim_.Get(),
                 D2D1_DRAW_TEXT_OPTIONS_CLIP,
                 DWRITE_MEASURING_MODE_NATURAL);
         }
