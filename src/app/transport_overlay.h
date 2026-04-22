@@ -38,6 +38,17 @@ public:
 
     void set_playback(PlaybackController* pc) noexcept { playback_ = pc; }
 
+    // Hook for the fullscreen button. MainWindow registers a
+    // function + opaque user pointer; clicking the button invokes
+    // it. Kept as a raw callback rather than a MainWindow* so the
+    // overlay doesn't take a direct dependency on MainWindow.
+    using FullscreenToggleFn = void(*)(void* user);
+    void set_fullscreen_toggle(FullscreenToggleFn fn, void* user) noexcept
+    {
+        fs_toggle_     = fn;
+        fs_toggle_user_ = user;
+    }
+
     // Optional thumbnail provider. When set AND the mouse hovers over
     // the scrub bar, the overlay requests previews at the hover time
     // and draws the most recent one above the bar. Null = no preview
@@ -82,6 +93,8 @@ private:
         float         seek_x0;
         float         seek_x1;
         float         seek_y;
+        D2D1_RECT_F   fs_button;
+        D2D1_POINT_2F fs_center;
         D2D1_RECT_F   volume_button;
         D2D1_POINT_2F volume_center;
         // Vertical volume slider popup. `volume_popup_hit` is the mouse
@@ -130,11 +143,15 @@ private:
     int   mouse_y_         = -1;
     bool  hover_play_      = false;
     bool  hover_stop_      = false;
+    bool  hover_fs_        = false;
     bool  hover_seek_      = false;
     bool  hover_volume_    = false;   // over speaker OR popup panel
     bool  volume_dragging_ = false;   // mouse-down inside slider track
     bool  seek_dragging_   = false;
     float drag_progress_   = 0.0f;
+
+    FullscreenToggleFn fs_toggle_      = nullptr;
+    void*              fs_toggle_user_ = nullptr;
     // Last hover time (in stream pts) we asked the thumbnail decoder
     // for. Used so we don't re-request while the mouse is sitting on
     // the same spot.

@@ -123,6 +123,12 @@ void MainWindow::create(HINSTANCE instance)
         overlay_renderer_.create(presenter_.d3d());
         overlay_renderer_.attach_swap_chain(presenter_.swap_chain());
         transport_overlay_.create(overlay_renderer_);
+        transport_overlay_.set_fullscreen_toggle(
+            [](void* user) noexcept {
+                auto* self = static_cast<MainWindow*>(user);
+                if (self != nullptr) self->toggle_fullscreen();
+            },
+            this);
         playlist_overlay_.create(overlay_renderer_);
         playlist_overlay_.set_play_request(
             &MainWindow::playlist_play_request, this);

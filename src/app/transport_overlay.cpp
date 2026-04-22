@@ -206,6 +206,14 @@ TransportOverlay::compute_layout(UINT w, UINT h) const noexcept
     l.volume_center        = D2D1::Point2F(
         (l.volume_button.left + l.volume_button.right) * 0.5f, row_y);
 
+    // Fullscreen button sits directly left of the speaker.
+    l.fs_button.right  = l.volume_button.left - kBtnGap;
+    l.fs_button.left   = l.fs_button.right - kBtnSize;
+    l.fs_button.top    = row_y - kBtnSize * 0.5f;
+    l.fs_button.bottom = row_y + kBtnSize * 0.5f;
+    l.fs_center        = D2D1::Point2F(
+        (l.fs_button.left + l.fs_button.right) * 0.5f, row_y);
+
     // Vertical popup slider centred above the speaker.
     l.volume_popup_panel.left   = l.volume_center.x - kVolPopupW * 0.5f;
     l.volume_popup_panel.right  = l.volume_center.x + kVolPopupW * 0.5f;
@@ -227,7 +235,7 @@ TransportOverlay::compute_layout(UINT w, UINT h) const noexcept
     l.volume_slider_track.bottom = l.volume_slider_y1;
 
     l.seek_x0 = l.stop_button.right + kSeekGap;
-    l.seek_x1 = l.volume_button.left - kSeekGap;
+    l.seek_x1 = l.fs_button.left    - kSeekGap;
     l.seek_y  = row_y;
     if (l.seek_x1 < l.seek_x0 + 40.0f) {
         // Too narrow for a scrub bar; collapse the hit region.
@@ -295,6 +303,7 @@ void TransportOverlay::on_mouse_move(int x, int y, UINT w, UINT h) noexcept
     const Layout l = compute_layout(w, h);
     hover_play_ = hit(l.play_button, x, y);
     hover_stop_ = hit(l.stop_button, x, y);
+    hover_fs_   = hit(l.fs_button, x, y);
     // Volume hover is sticky across speaker <-> popup so the slider
     // stays up while the user reaches for it. Popup panel is only
     // included in the hit once the user is already hovering; that way
@@ -376,6 +385,17 @@ void TransportOverlay::on_lbutton_down(int x, int y, UINT w, UINT h) noexcept
         return;
     }
 
+    if (hit(l.fs_button, x, y)) {
+        if (fs_toggle_ != nullptr) {
+            try {
+                fs_toggle_(fs_toggle_user_);
+            } catch (...) {
+                log::error("transport fs click: unknown");
+            }
+        }
+        return;
+    }
+
     // Volume slider drag — start when clicking inside the popup panel
     // (it's only visible while hover_volume_ is true, but we still
     // check the rect to be defensive).
@@ -444,6 +464,7 @@ void TransportOverlay::on_mouse_leave() noexcept
         mouse_y_      = -1;
         hover_play_   = false;
         hover_stop_   = false;
+        hover_fs_     = false;
         hover_seek_   = false;
         hover_volume_ = false;
     }
@@ -591,6 +612,39 @@ void TransportOverlay::draw(ID2D1DeviceContext* ctx, UINT w, UINT h) noexcept
             l.stop_center.y + sq * 0.5f,
         };
         ctx->FillRectangle(s, brush_icon_.Get());
+    }
+
+    // 4c. Fullscreen glyph — four L-shaped corner brackets pointing
+    //     outward (enter FS). We don't track FS state here so the
+    //     icon stays constant in both states; the action toggles.
+    brush_icon_->SetOpacity(alpha_ * (hover_fs_ ? 1.0f : 0.85f));
+    {
+        const float cx = l.fs_center.x;
+        const float cy = l.fs_center.y;
+        const float sz = 14.0f;   // half-extent of the icon area
+        const float th = 2.0f;    // stroke thickness
+        const float arm = 6.0f;   // length of each corner arm
+
+        // Top-left bracket.
+        ctx->FillRectangle(
+            D2D1::RectF(cx - sz,      cy - sz,      cx - sz + arm, cy - sz + th), brush_icon_.Get());
+        ctx->FillRectangle(
+            D2D1::RectF(cx - sz,      cy - sz,      cx - sz + th,  cy - sz + arm), brush_icon_.Get());
+        // Top-right.
+        ctx->FillRectangle(
+            D2D1::RectF(cx + sz - arm, cy - sz,     cx + sz,       cy - sz + th),  brush_icon_.Get());
+        ctx->FillRectangle(
+            D2D1::RectF(cx + sz - th,  cy - sz,     cx + sz,       cy - sz + arm), brush_icon_.Get());
+        // Bottom-left.
+        ctx->FillRectangle(
+            D2D1::RectF(cx - sz,       cy + sz - th,  cx - sz + arm, cy + sz),     brush_icon_.Get());
+        ctx->FillRectangle(
+            D2D1::RectF(cx - sz,       cy + sz - arm, cx - sz + th,  cy + sz),     brush_icon_.Get());
+        // Bottom-right.
+        ctx->FillRectangle(
+            D2D1::RectF(cx + sz - arm, cy + sz - th,  cx + sz,       cy + sz),     brush_icon_.Get());
+        ctx->FillRectangle(
+            D2D1::RectF(cx + sz - th,  cy + sz - arm, cx + sz,       cy + sz),     brush_icon_.Get());
     }
 
     // 5. Speaker / mute icon. A small trapezoid cone + three stubby
