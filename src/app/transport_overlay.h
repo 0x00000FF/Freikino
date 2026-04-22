@@ -120,6 +120,10 @@ private:
     ComPtr<ID2D1SolidColorBrush> brush_text_;
     ComPtr<ID2D1PathGeometry>    play_geo_;
     ComPtr<IDWriteTextFormat>    text_format_;
+    // Dedicated format for the hover-time label drawn above the
+    // scrub thumbnail. Center-aligned so `position_on_bar` can hand
+    // in the cursor x as the midpoint.
+    ComPtr<IDWriteTextFormat>    text_thumb_time_;
 
     // Input state.
     int   mouse_x_         = -1;

@@ -117,6 +117,18 @@ void TransportOverlay::create(render::OverlayRenderer& renderer)
     text_format_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING);
     text_format_->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
 
+    // Hover-time label above the scrub thumbnail.
+    check_hr(dw->CreateTextFormat(
+        L"Segoe UI", nullptr,
+        DWRITE_FONT_WEIGHT_SEMI_BOLD,
+        DWRITE_FONT_STYLE_NORMAL,
+        DWRITE_FONT_STRETCH_NORMAL,
+        13.0f,
+        L"en-us",
+        &text_thumb_time_));
+    text_thumb_time_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+    text_thumb_time_->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+
     // Play triangle geometry (pause is a pair of rects — no geometry needed).
     auto* factory = renderer.d2d_factory();
     if (factory == nullptr) {
@@ -688,6 +700,12 @@ void TransportOverlay::draw(ID2D1DeviceContext* ctx, UINT w, UINT h) noexcept
     if (show_thumb) {
         refresh_thumb_bitmap(ctx);
     }
+    // Hover-time label y/x. Computed here so we can draw it even when
+    // no thumbnail bitmap is available (file with no video, or
+    // thumbnail decoder failed) — user still gets the time readout.
+    float label_cx = 0.0f;
+    float label_y  = 0.0f;
+    bool  want_label = false;
     if (show_thumb && thumb_bitmap_) {
         const D2D1_SIZE_F bmp_size = thumb_bitmap_->GetSize();
         float tx = static_cast<float>(mouse_x_) - bmp_size.width * 0.5f;
@@ -715,6 +733,66 @@ void TransportOverlay::draw(ID2D1DeviceContext* ctx, UINT w, UINT h) noexcept
             bmp_dest,
             alpha_,
             D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+
+        label_cx = tx + bmp_size.width * 0.5f;
+        label_y  = ty - 4.0f;    // sit just above the border
+        want_label = true;
+    } else if (show_thumb) {
+        // No thumbnail — park the label directly above the scrub bar
+        // at the cursor x, clamped to the window edges.
+        label_cx = static_cast<float>(mouse_x_);
+        label_y  = l.seek_y - kThumbAboveBar;
+        want_label = true;
+    }
+
+    // 6b. Hover-time label. Computed from the cursor's x-on-track, so
+    //     it follows the scrub head precisely regardless of whether a
+    //     thumbnail decoded in time.
+    if (want_label
+        && text_thumb_time_ != nullptr
+        && playback_ != nullptr) {
+        const int64_t dur = playback_->duration_ns();
+        if (dur > 0) {
+            const float t = position_on_bar(mouse_x_, l);
+            const int64_t hover_pts = static_cast<int64_t>(
+                static_cast<double>(t) * static_cast<double>(dur));
+            const std::wstring time_str = format_time_ns(hover_pts);
+
+            constexpr float kLabelHalfW = 50.0f;
+            constexpr float kLabelH     = 18.0f;
+            D2D1_RECT_F label_rect{
+                label_cx - kLabelHalfW,
+                label_y - kLabelH,
+                label_cx + kLabelHalfW,
+                label_y,
+            };
+            // Keep the label on-screen horizontally.
+            const float fw = static_cast<float>(w);
+            if (label_rect.left < kThumbEdgeGuard) {
+                const float shift = kThumbEdgeGuard - label_rect.left;
+                label_rect.left  += shift;
+                label_rect.right += shift;
+            } else if (label_rect.right > fw - kThumbEdgeGuard) {
+                const float shift = label_rect.right - (fw - kThumbEdgeGuard);
+                label_rect.left  -= shift;
+                label_rect.right -= shift;
+            }
+
+            // Small dimmed pill behind the text so the label reads
+            // on any background.
+            brush_bg_->SetOpacity(alpha_ * 0.7f);
+            ctx->FillRectangle(label_rect, brush_bg_.Get());
+
+            brush_text_->SetOpacity(alpha_);
+            ctx->DrawTextW(
+                time_str.c_str(),
+                static_cast<UINT32>(time_str.size()),
+                text_thumb_time_.Get(),
+                label_rect,
+                brush_text_.Get(),
+                D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                DWRITE_MEASURING_MODE_NATURAL);
+        }
     }
 
     // 7. Time readout — either live playback position or drag preview.
