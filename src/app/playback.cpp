@@ -267,8 +267,25 @@ void PlaybackController::seek_by(int64_t delta_ns)
     if (source_ == nullptr) {
         return;
     }
+    // Hold-to-repeat on ←/→ fires seek_by at the keyboard auto-repeat
+    // rate (~30 Hz). Each seek tears down audio, so the audio clock
+    // returns 0 (start_pts reset to INT64_MIN) until the decoder
+    // catches up past the seek target — typically well after the next
+    // repeat arrives. Reading `current_time_ns()` during that window
+    // yields 0 and `seek_by(-kStepShort)` collapses into
+    // `seek_to(-kStepShort)` → clamped to 0, so the user sees the
+    // video snap back to the start while they're holding the key.
+    //
+    // Chain off `last_seek_target_ns_` when the clock hasn't reached
+    // it yet: that's the intended position of the most recent seek
+    // request, which is a better base than the stalled clock.
     const int64_t now = current_time_ns();
-    seek_to(now + delta_ns);
+    int64_t base = now;
+    if (last_seek_target_ns_ != INT64_MIN
+        && now < last_seek_target_ns_) {
+        base = last_seek_target_ns_;
+    }
+    seek_to(base + delta_ns);
 #else
     (void)delta_ns;
 #endif
