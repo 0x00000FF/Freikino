@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <vector>
@@ -66,6 +67,16 @@ public:
     // = earlier. Stored in nanoseconds.
     void     set_delay_ns(int64_t ns) noexcept;
     [[nodiscard]] int64_t delay_ns() const noexcept;
+
+    // Register a font with libass by name + raw bytes (as produced by
+    // e.g. an MKV attachment stream) so styled subtitles that name it
+    // render correctly. The caller must keep `data` alive for the
+    // lifetime of this source — libass stores the pointer, not a
+    // copy. No-op until a track has been loaded (the library is
+    // created lazily).
+    void     add_font(const char* name,
+                      const std::uint8_t* data,
+                      int size) noexcept;
 
 private:
     struct State;

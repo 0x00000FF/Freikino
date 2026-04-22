@@ -158,6 +158,21 @@ public:
     };
     [[nodiscard]] std::vector<SubtitleTrack> subtitle_tracks() const noexcept;
 
+    // One entry per font attachment stream in the container
+    // (AVMEDIA_TYPE_ATTACHMENT with a TTF/OTF codec id). MKV files
+    // commonly bundle the fonts their ASS styles reference, and
+    // passing these to libass via `ass_add_font` lets styled
+    // embedded subs render as the content author intended.
+    //
+    // `name` is the attachment's `filename` metadata (if any); `data`
+    // is a copy of codecpar->extradata. Enumerated at `open()` and
+    // static thereafter.
+    struct FontAttachment {
+        std::string               name;
+        std::vector<std::uint8_t> data;
+    };
+    [[nodiscard]] std::vector<FontAttachment> font_attachments() const noexcept;
+
     // Pull the full dialogue history of a subtitle stream and return
     // it as a self-contained ASS document (Script Info + V4+ Styles +
     // Events). Opens a secondary AVFormatContext on the same file so

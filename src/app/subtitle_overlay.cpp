@@ -92,6 +92,41 @@ void SubtitleOverlay::set_source(media::FFmpegSource* src) noexcept
             }),
         tracks_.end());
     source_ = src;
+
+    // Append this container's font attachments to the cache. We
+    // don't prune — external tracks that were loaded against the
+    // previous file's fonts would have pointers dangling into the
+    // pruned bytes (libass's ass_add_font keeps a non-owning
+    // reference). `clear()` is the only place that wipes the blob
+    // list, and only after all tracks are already gone.
+    if (src != nullptr) {
+        std::size_t before = font_blobs_.size();
+        for (auto& att : src->font_attachments()) {
+            FontBlob b;
+            b.name = std::move(att.name);
+            b.data = std::move(att.data);
+            font_blobs_.push_back(std::move(b));
+        }
+        const std::size_t added = font_blobs_.size() - before;
+        if (added > 0) {
+            log::info("subtitle: cached {} font attachment(s)", added);
+            // Make the newly-added fonts visible to any already-
+            // loaded external track's library, too — a dropped-in
+            // SRT/ASS might name a font the new container carries.
+            for (auto& t : tracks_) {
+                if (t && t->ever_loaded && t->source) {
+                    for (std::size_t i = before; i < font_blobs_.size(); ++i) {
+                        const auto& blob = font_blobs_[i];
+                        t->source->add_font(
+                            blob.name.empty() ? nullptr : blob.name.c_str(),
+                            blob.data.data(),
+                            static_cast<int>(blob.data.size()));
+                    }
+                }
+            }
+        }
+    }
+
     sync_embedded_tracks();
 }
 
@@ -165,6 +200,7 @@ bool SubtitleOverlay::load(const std::wstring& path)
                     std::string(entry.ass_content), display)) {
                 continue;
             }
+            apply_fonts(*t);
             t->renderer->set_source(t->source.get());
             t->ever_loaded = true;
             t->label       = display;
@@ -204,6 +240,7 @@ bool SubtitleOverlay::load(const std::wstring& path)
         active_display_name_.clear();
         return false;
     }
+    apply_fonts(*t);
     t->renderer->set_source(t->source.get());
     t->ever_loaded = true;
     t->active      = true;
@@ -219,7 +256,13 @@ bool SubtitleOverlay::load(const std::wstring& path)
 
 void SubtitleOverlay::clear() noexcept
 {
+    // Order matters: drop tracks (and with them every ASS_Library
+    // that referenced entries in `font_blobs_`) before freeing the
+    // font bytes. Destructors would run in this order anyway if the
+    // overlay itself were being destroyed (see the field order in
+    // the header), but on an explicit clear() we enforce it.
     tracks_.clear();
+    font_blobs_.clear();
     external_path_.clear();
     active_display_name_.clear();
 }
@@ -435,6 +478,7 @@ void SubtitleOverlay::poll_embedded_extractions() noexcept
             t.active = false;
             continue;
         }
+        apply_fonts(t);
         t.renderer->set_source(t.source.get());
         t.ever_loaded = true;
         t.cache_dirty = true;
@@ -450,6 +494,16 @@ void SubtitleOverlay::apply_settings(Track& t) noexcept
     if (t.renderer) {
         t.renderer->set_font_scale(font_scale_);
         t.renderer->set_font_override(font_override_);
+    }
+}
+
+void SubtitleOverlay::apply_fonts(Track& t) noexcept
+{
+    if (!t.source) return;
+    for (const auto& blob : font_blobs_) {
+        const char* name = blob.name.empty() ? nullptr : blob.name.c_str();
+        t.source->add_font(
+            name, blob.data.data(), static_cast<int>(blob.data.size()));
     }
 }
 

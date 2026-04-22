@@ -170,6 +170,7 @@ struct FFmpegSource::State {
     FFmpegSource::AlbumArt      album_art;
     std::vector<FFmpegSource::AudioTrack>    audio_tracks;
     std::vector<FFmpegSource::SubtitleTrack> subtitle_tracks;
+    std::vector<FFmpegSource::FontAttachment> font_attachments;
     // UTF-8 path retained so `extract_subtitle_ass` can open a
     // secondary AVFormatContext without having to thread the wide
     // path through.
@@ -506,6 +507,50 @@ void FFmpegSource::open(const std::wstring& path)
         s_->subtitle_tracks.push_back(std::move(t));
     }
 
+    // ---- Font attachments ----
+    // Matroska routinely ships TTF/OTF attachments alongside styled
+    // subs. codecpar->extradata carries the file bytes; the
+    // "filename" metadata tag (where present) gives the name the
+    // subtitle events reference.
+    for (unsigned i = 0; i < s_->fmt->nb_streams; ++i) {
+        AVStream* st = s_->fmt->streams[i];
+        if (st->codecpar->codec_type != AVMEDIA_TYPE_ATTACHMENT) {
+            continue;
+        }
+        if (st->codecpar->extradata == nullptr
+            || st->codecpar->extradata_size <= 0) {
+            continue;
+        }
+        // Only forward attachments we know libass can use. Images
+        // and arbitrary blobs aren't helpful here.
+        const AVCodecID cid = st->codecpar->codec_id;
+        const bool is_font = (cid == AV_CODEC_ID_TTF)
+                          || (cid == AV_CODEC_ID_OTF);
+        if (!is_font) {
+            // Some containers report the font codec as "none" but
+            // advertise "application/x-truetype-font" in a mimetype
+            // tag. Honour that so we don't silently drop fonts a
+            // muxer forgot to label.
+            const std::string mime =
+                read_str_tag(st->metadata, "mimetype");
+            if (mime.find("font") == std::string::npos
+                && mime.find("truetype") == std::string::npos
+                && mime.find("opentype") == std::string::npos) {
+                continue;
+            }
+        }
+        FontAttachment f;
+        f.name = read_str_tag(st->metadata, "filename");
+        f.data.assign(
+            st->codecpar->extradata,
+            st->codecpar->extradata + st->codecpar->extradata_size);
+        s_->font_attachments.push_back(std::move(f));
+    }
+    if (!s_->font_attachments.empty()) {
+        log::info("ffmpeg: {} font attachment(s) found",
+                  s_->font_attachments.size());
+    }
+
     // ---- Audio stream ----
     if (s_->audio_target_set) {
         const int audio_idx = av_find_best_stream(
@@ -748,6 +793,12 @@ std::vector<FFmpegSource::SubtitleTrack>
 FFmpegSource::subtitle_tracks() const noexcept
 {
     return s_ ? s_->subtitle_tracks : std::vector<SubtitleTrack>{};
+}
+
+std::vector<FFmpegSource::FontAttachment>
+FFmpegSource::font_attachments() const noexcept
+{
+    return s_ ? s_->font_attachments : std::vector<FontAttachment>{};
 }
 
 std::string FFmpegSource::extract_subtitle_ass(int stream_index) const noexcept

@@ -5,6 +5,7 @@
 #include "freikino/subtitle/subtitle_source.h"
 
 #include <cstddef>
+#include <cstdint>
 #include <future>
 #include <memory>
 #include <string>
@@ -183,6 +184,13 @@ private:
     // override) to one track. Called when a track is (re)loaded.
     void apply_settings(Track& t) noexcept;
 
+    // Register every cached container font with the given track's
+    // libass library so styled subs that name those fonts render
+    // correctly. Each track has its own ASS_Library, so fonts have
+    // to be attached per-track. Called right after a track's
+    // source is (re)opened.
+    void apply_fonts(Track& t) noexcept;
+
     // Find the external slot, or nullptr if none. External tracks are
     // kept in `tracks_[0]` by convention so `current_name()` + the
     // encoding-reload path can reach them cheaply.
@@ -191,6 +199,19 @@ private:
 
     PlaybackController*                  playback_ = nullptr;
     media::FFmpegSource*                 source_   = nullptr;
+
+    // Container-bundled TrueType / OpenType attachments. Deliberately
+    // declared BEFORE `tracks_` so the destruction order frees every
+    // Track (and its ASS_Library via ~SubtitleSource) before these
+    // bytes — libass's ass_add_font stores a non-owning pointer into
+    // the library, so the bytes must outlive every library that saw
+    // them. Cleared only by `clear()` (when all tracks are already
+    // dropped); `set_source` only appends.
+    struct FontBlob {
+        std::string               name;
+        std::vector<std::uint8_t> data;
+    };
+    std::vector<FontBlob>                font_blobs_;
 
     std::vector<std::unique_ptr<Track>>  tracks_;
     std::wstring                         external_path_; // for encoding reload

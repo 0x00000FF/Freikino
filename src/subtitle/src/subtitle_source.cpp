@@ -1460,4 +1460,23 @@ int64_t SubtitleSource::delay_ns() const noexcept
         ? s_->delay_ns.load(std::memory_order_acquire) : 0;
 }
 
+void SubtitleSource::add_font(
+    const char* name, const std::uint8_t* data, int size) noexcept
+{
+    if (s_ == nullptr || data == nullptr || size <= 0) {
+        return;
+    }
+    if (s_->library == nullptr) {
+        s_->library = ass_library_init();
+        if (s_->library == nullptr) return;
+    }
+    ass_add_font(
+        s_->library,
+        name,  // libass permits null here (logs as "(null)")
+        // ass_add_font takes `char*` but does not mutate the buffer.
+        // libass keeps the pointer; the caller guarantees lifetime.
+        reinterpret_cast<char*>(const_cast<std::uint8_t*>(data)),
+        size);
+}
+
 } // namespace freikino::subtitle
