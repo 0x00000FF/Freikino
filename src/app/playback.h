@@ -73,6 +73,22 @@ public:
     [[nodiscard]] int64_t current_time_ns() const noexcept;
     [[nodiscard]] int64_t duration_ns()     const noexcept;
 
+    // Transition kind fired by the state-change callback. Narrower
+    // than State — differentiates "stopped" (seek-to-0 + paused)
+    // from a plain pause.
+    enum class Transition {
+        Playing,
+        Paused,
+        Stopped,
+    };
+
+    using StateChangeFn = void(*)(void* user, Transition t);
+    void set_state_change_callback(StateChangeFn fn, void* user) noexcept
+    {
+        on_state_change_     = fn;
+        on_state_change_user_ = user;
+    }
+
     // Source's native video frame rate, 0 if no source or audio-only.
     // Used for Shift+Left/Right frame stepping; a sensible fallback of
     // 30 fps is applied upstream if this returns 0.
@@ -93,6 +109,15 @@ private:
 #endif
 
     std::atomic<State> state_{State::no_source};
+
+    StateChangeFn on_state_change_      = nullptr;
+    void*         on_state_change_user_ = nullptr;
+    void fire_transition(Transition t) noexcept
+    {
+        if (on_state_change_ != nullptr) {
+            on_state_change_(on_state_change_user_, t);
+        }
+    }
 
     // Tracks the last requested seek target so repeat requests (e.g.
     // scrub bar firing twice at the same x) can short-circuit instead

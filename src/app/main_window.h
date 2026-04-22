@@ -2,6 +2,7 @@
 
 #include "audio_info_overlay.h"
 #include "debug_overlay.h"
+#include "playback.h"
 #include "freikino/render/overlay_renderer.h"
 #include "freikino/render/presenter.h"
 #include "freikino/ui/window.h"
@@ -27,7 +28,6 @@ namespace freikino::audio { class WasapiRenderer; }
 namespace freikino::app {
 
 class MediaSession;
-class PlaybackController;
 class Playlist;
 
 class MainWindow final : public ui::Window {
@@ -93,6 +93,12 @@ public:
     // bleed onto a newly-opened file.
     void clear_subtitles() noexcept { subtitle_overlay_.clear(); }
 
+    // Look for a sibling subtitle file next to `video_path` (same
+    // base name, different extension) and load it via SubtitleOverlay
+    // if found. Priority: .ass > .ssa > .srt > .smi > .sami.
+    // Called by MediaSession::complete_open().
+    void auto_load_sibling_subtitle(const std::wstring& video_path) noexcept;
+
     // Toggle the audio-only visualizer path. MediaSession calls this
     // in complete_open() once it knows whether the new source has
     // video. Track info (metadata + album art) is passed through so
@@ -124,6 +130,11 @@ private:
     // clicked. Resolves to play_playlist_index().
     static void playlist_play_request(void* user, std::size_t index) noexcept;
     void play_playlist_index(std::size_t index) noexcept;
+
+    // Pop the top-of-screen toast with the playback transition label
+    // ("Playing" / "Paused" / "Stopped"), appending "(Subtitled)" if
+    // a subtitle track is currently loaded.
+    void show_state_toast(PlaybackController::Transition t) noexcept;
 
     // Reacts to a default-audio-device change notification from
     // WasapiRenderer. Pauses, reloads the renderer onto the new

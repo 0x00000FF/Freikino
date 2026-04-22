@@ -68,6 +68,7 @@ void PlaybackController::pause()
     }
     state_.store(State::paused, std::memory_order_release);
     log::info("playback: paused");
+    fire_transition(Transition::Paused);
 }
 
 void PlaybackController::stop()
@@ -75,8 +76,13 @@ void PlaybackController::stop()
     seek_to(0);
     const State s = state_.load(std::memory_order_acquire);
     if (s == State::playing) {
+        // Calls pause() which fires Transition::Paused; we override
+        // with Transition::Stopped below so the observer sees the
+        // right label. Synchronous callback so the Paused toast is
+        // overwritten in place before it ever renders.
         pause();
     }
+    fire_transition(Transition::Stopped);
 }
 
 void PlaybackController::rebind_source(media::FFmpegSource* src) noexcept
@@ -106,6 +112,7 @@ void PlaybackController::resume()
     }
     state_.store(State::playing, std::memory_order_release);
     log::info("playback: playing");
+    fire_transition(Transition::Playing);
 }
 
 int64_t PlaybackController::duration_ns() const noexcept

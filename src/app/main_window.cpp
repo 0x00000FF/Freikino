@@ -190,6 +190,15 @@ void MainWindow::set_playback(PlaybackController* controller) noexcept
     subtitle_overlay_.set_playback(controller);
     debug_overlay_.set_runtime(
         presenter_created_ ? &presenter_ : nullptr, controller);
+
+    if (controller != nullptr) {
+        controller->set_state_change_callback(
+            [](void* user, PlaybackController::Transition t) noexcept {
+                auto* self = static_cast<MainWindow*>(user);
+                if (self != nullptr) self->show_state_toast(t);
+            },
+            this);
+    }
 }
 
 void MainWindow::set_playlist(Playlist* playlist, MediaSession* session) noexcept
@@ -873,6 +882,62 @@ void MainWindow::show_title_toast(std::wstring text) noexcept
         title_toast_.show(std::move(text));
     }
     refresh_title();
+}
+
+void MainWindow::show_state_toast(
+    PlaybackController::Transition t) noexcept
+{
+    const wchar_t* label = L"";
+    switch (t) {
+    case PlaybackController::Transition::Playing: label = L"Playing"; break;
+    case PlaybackController::Transition::Paused:  label = L"Paused";  break;
+    case PlaybackController::Transition::Stopped: label = L"Stopped"; break;
+    }
+    std::wstring text = label;
+    if (subtitle_overlay_.loaded()) {
+        text += L" (Subtitled)";
+    }
+    // Bypass show_title_toast's incognito check — state changes are
+    // about UI feedback, not file identity.
+    title_toast_.show(std::move(text));
+    transport_overlay_.bump_activity();
+}
+
+void MainWindow::auto_load_sibling_subtitle(
+    const std::wstring& video_path) noexcept
+{
+    if (video_path.empty()) return;
+
+    // Strip the extension off the video path (keep the directory
+    // part intact). Guard against a lone dot in a directory name —
+    // the dot must be AFTER the last slash.
+    const std::size_t slash = video_path.find_last_of(L"\\/");
+    const std::size_t dot   = video_path.find_last_of(L'.');
+    if (dot == std::wstring::npos
+        || (slash != std::wstring::npos && dot < slash)) {
+        return;
+    }
+    const std::wstring base = video_path.substr(0, dot);
+
+    // Priority order matches the request: ASS/SSA first (most
+    // feature-complete), then SRT, then SMI/SAMI. Subtitle module
+    // doesn't support anything else yet, so the list is closed.
+    static constexpr const wchar_t* kExts[] = {
+        L".ass", L".ssa", L".srt", L".smi", L".sami",
+    };
+    for (const auto* ext : kExts) {
+        std::wstring candidate = base + ext;
+        const DWORD attrs = ::GetFileAttributesW(candidate.c_str());
+        if (attrs == INVALID_FILE_ATTRIBUTES
+            || (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0) {
+            continue;
+        }
+        if (subtitle_overlay_.load(candidate)) {
+            log::info("auto-loaded subtitle: {}",
+                      wide_to_utf8(candidate));
+        }
+        return;
+    }
 }
 
 void MainWindow::set_audio_only_mode(
