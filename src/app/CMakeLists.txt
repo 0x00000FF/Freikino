@@ -32,6 +32,8 @@ target_link_libraries(freikino
         dwmapi
         ole32
         shell32
+        windowscodecs
+        shlwapi
 )
 
 target_link_libraries(freikino PRIVATE freikino::audio)

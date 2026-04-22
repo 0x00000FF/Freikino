@@ -18,6 +18,8 @@
 #include <commdlg.h>
 #include <dwmapi.h>
 #include <shellapi.h>
+#include <shlwapi.h>
+#include <wincodec.h>
 
 #ifndef DWMWA_USE_IMMERSIVE_DARK_MODE
 #define DWMWA_USE_IMMERSIVE_DARK_MODE 20
@@ -1368,20 +1370,149 @@ HGLOBAL build_dibv5_hglobal(const std::vector<std::uint8_t>& rgba,
         dst[i + 0] = src[i + 2]; // B
         dst[i + 1] = src[i + 1]; // G
         dst[i + 2] = src[i + 0]; // R
-        dst[i + 3] = src[i + 3]; // A
+        // Force opaque. The swapchain is DXGI_ALPHA_MODE_IGNORE, so
+        // whatever lives in the back buffer's alpha channel is
+        // whatever the video shader / D2D overlay happened to
+        // write — often 0, which browsers that honour the
+        // CF_DIBV5 alpha mask then render as a fully transparent
+        // image. The user sees an opaque scene in the window, so
+        // emit an opaque scene to the clipboard.
+        dst[i + 3] = 0xFF;
     }
     ::GlobalUnlock(hg);
     return hg;
 }
 
-// Publish both CF_DIB and CF_DIBV5. Some legacy apps only consume
-// CF_DIB; newer ones (browsers, Paint.NET, ShareX) prefer CF_DIBV5
-// with alpha + colourspace. Writing both avoids picking winners.
+// Encode the captured R8G8B8A8 buffer as PNG using Windows Imaging
+// Component. Returns the encoded bytes, or an empty vector on any
+// failure (COM not initialised, factory creation failed, writer
+// rejected the pixel format, etc.). Same alpha-stamp reasoning as
+// the CF_DIBV5 path: force every pixel opaque so downstream
+// consumers treat the image as a solid scene.
+std::vector<std::uint8_t> encode_rgba_to_png(
+    const std::vector<std::uint8_t>& rgba,
+    UINT width, UINT height) noexcept
+{
+    std::vector<std::uint8_t> out;
+    const std::size_t pixel_bytes =
+        static_cast<std::size_t>(width) * height * 4;
+    if (width == 0 || height == 0 || rgba.size() < pixel_bytes) {
+        return out;
+    }
+
+    ComPtr<IWICImagingFactory> factory;
+    HRESULT hr = ::CoCreateInstance(
+        CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
+        IID_PPV_ARGS(&factory));
+    if (FAILED(hr)) {
+        log::warn("clipboard: WIC factory failed 0x{:08X}",
+                  static_cast<unsigned>(hr));
+        return out;
+    }
+
+    ComPtr<IStream> stream;
+    stream.Attach(::SHCreateMemStream(nullptr, 0));
+    if (!stream) {
+        return out;
+    }
+
+    ComPtr<IWICBitmapEncoder> encoder;
+    if (FAILED(factory->CreateEncoder(
+            GUID_ContainerFormatPng, nullptr, &encoder))
+        || FAILED(encoder->Initialize(
+            stream.Get(), WICBitmapEncoderNoCache))) {
+        return out;
+    }
+
+    ComPtr<IWICBitmapFrameEncode> frame;
+    if (FAILED(encoder->CreateNewFrame(&frame, nullptr))
+        || FAILED(frame->Initialize(nullptr))
+        || FAILED(frame->SetSize(width, height))) {
+        return out;
+    }
+
+    // Ask for RGBA (matches our source). If the PNG encoder
+    // negotiates a different format, it'll return one through the
+    // inout pointer and we'd need to convert — but PNG supports
+    // RGBA natively so this succeeds in practice.
+    WICPixelFormatGUID px = GUID_WICPixelFormat32bppRGBA;
+    if (FAILED(frame->SetPixelFormat(&px))) {
+        return out;
+    }
+
+    // Copy + overwrite alpha so the PNG is opaque regardless of
+    // what the back buffer's unused alpha channel happened to hold.
+    std::vector<std::uint8_t> opaque(rgba.size());
+    for (std::size_t i = 0; i + 3 < pixel_bytes; i += 4) {
+        opaque[i + 0] = rgba[i + 0];
+        opaque[i + 1] = rgba[i + 1];
+        opaque[i + 2] = rgba[i + 2];
+        opaque[i + 3] = 0xFF;
+    }
+
+    const UINT stride = width * 4;
+    if (FAILED(frame->WritePixels(
+            height, stride,
+            static_cast<UINT>(pixel_bytes),
+            opaque.data()))
+        || FAILED(frame->Commit())
+        || FAILED(encoder->Commit())) {
+        return out;
+    }
+
+    // Read the encoded bytes back out of the stream.
+    STATSTG stat{};
+    if (FAILED(stream->Stat(&stat, STATFLAG_NONAME))) {
+        return out;
+    }
+    const ULONG size =
+        static_cast<ULONG>(stat.cbSize.QuadPart);
+    out.resize(size);
+    LARGE_INTEGER zero{};
+    stream->Seek(zero, STREAM_SEEK_SET, nullptr);
+    ULONG read = 0;
+    if (FAILED(stream->Read(out.data(), size, &read))
+        || read != size) {
+        out.clear();
+    }
+    return out;
+}
+
+// Wrap an encoded blob in a GMEM_MOVEABLE HGLOBAL so we can hand
+// it to SetClipboardData. Used for PNG on a custom clipboard
+// format; the caller still owns the blob.
+HGLOBAL hglobal_from_bytes(const std::vector<std::uint8_t>& bytes) noexcept
+{
+    if (bytes.empty()) return nullptr;
+    HGLOBAL hg = ::GlobalAlloc(GMEM_MOVEABLE, bytes.size());
+    if (hg == nullptr) return nullptr;
+    void* mem = ::GlobalLock(hg);
+    if (mem == nullptr) { ::GlobalFree(hg); return nullptr; }
+    std::memcpy(mem, bytes.data(), bytes.size());
+    ::GlobalUnlock(hg);
+    return hg;
+}
+
+// Publish every format the common paste targets care about:
+//   * CF_DIB      — legacy Win32 apps (old Paint, older IM clients)
+//   * CF_DIBV5    — modern Win32 apps (Paint.NET, ShareX, Office)
+//   * "PNG"       — Chromium reads this by name
+//   * "image/png" — Firefox reads this by name
+// Browsers pasting into <img>/contenteditable generally prefer the
+// PNG payload; without it they see the DIB variants and often fall
+// back to "image not supported" because a naked DIB from the
+// clipboard frequently has unusable alpha or unclear colourspace.
 bool put_rgba_on_clipboard_as_bgrx(
     HWND hwnd, const std::vector<std::uint8_t>& rgba,
     UINT width, UINT height) noexcept
 {
     if (width == 0 || height == 0) return false;
+
+    // Encode PNG BEFORE opening the clipboard — WIC calls involve
+    // COM and memory streams; failing while the clipboard is open
+    // would leak its lock.
+    const std::vector<std::uint8_t> png =
+        encode_rgba_to_png(rgba, width, height);
 
     if (!::OpenClipboard(hwnd)) {
         log::warn("clipboard: OpenClipboard failed, last error={}",
@@ -1416,6 +1547,27 @@ bool put_rgba_on_clipboard_as_bgrx(
         }
     } else {
         log::warn("clipboard: build_dib_hglobal returned null");
+    }
+
+    if (!png.empty()) {
+        const UINT cf_png = ::RegisterClipboardFormatW(L"PNG");
+        const UINT cf_img = ::RegisterClipboardFormatW(L"image/png");
+
+        auto publish = [&](UINT fmt, const wchar_t* name) {
+            if (fmt == 0) return;
+            HGLOBAL hg = hglobal_from_bytes(png);
+            if (hg == nullptr) return;
+            if (::SetClipboardData(fmt, hg) != nullptr) {
+                any_set = true;
+            } else {
+                log::warn("clipboard: SetClipboardData({}) failed le={}",
+                          wide_to_utf8(std::wstring{name}),
+                          ::GetLastError());
+                ::GlobalFree(hg);
+            }
+        };
+        publish(cf_png, L"PNG");
+        publish(cf_img, L"image/png");
     }
 
     ::CloseClipboard();
