@@ -436,18 +436,38 @@ void append_timestamp_ass(std::string& dst, int64_t ms) noexcept
     dst += buf;
 }
 
-// Replace characters that would confuse the ASS event line. `\N` is
-// a line break in ASS; everything else passes through.
+// Normalise the already-tag-stripped text into an ASS event body.
+// `\n` → `\N` (ASS line break), `\r` drops, and legitimate override
+// groups (`{\…}`) that the tag-stripper emitted for bold/italic/
+// colour are preserved verbatim. User-typed braces are dropped so
+// a malicious source can't inject arbitrary overrides.
 std::string ass_escape(const std::string& in) noexcept
 {
     std::string out;
     out.reserve(in.size());
-    for (std::size_t i = 0; i < in.size(); ++i) {
+    std::size_t i = 0;
+    while (i < in.size()) {
         const char c = in[i];
-        if (c == '\r') continue;
-        if (c == '\n') { out += "\\N"; continue; }
-        if (c == '{' || c == '}') continue;  // drop ASS override braces
+        if (c == '\r') { ++i; continue; }
+        if (c == '\n') { out += "\\N"; ++i; continue; }
+        if (c == '{') {
+            // Pass through only if it looks like a real override
+            // group — first non-brace char must be a backslash.
+            if (i + 1 < in.size() && in[i + 1] == '\\') {
+                const std::size_t end = in.find('}', i);
+                if (end != std::string::npos) {
+                    out.append(in, i, end - i + 1);
+                    i = end + 1;
+                    continue;
+                }
+            }
+            // User-typed brace (or malformed group); drop it.
+            ++i;
+            continue;
+        }
+        if (c == '}') { ++i; continue; }
         out += c;
+        ++i;
     }
     return out;
 }
@@ -493,6 +513,10 @@ int64_t parse_srt_time(const std::string& s, std::size_t pos) noexcept
     const int ms = ms1 * 100 + ms2 * 10 + ms3;
     return (static_cast<int64_t>(h) * 3600 + m * 60 + sc) * 1000 + ms;
 }
+
+// Defined below alongside the SAMI converter; forward-declared so
+// convert_srt_to_ass can use it to translate HTML-in-SRT tags.
+std::string strip_html(const std::string& in) noexcept;
 
 std::string convert_srt_to_ass(const std::string& src) noexcept
 {
@@ -569,7 +593,11 @@ std::string convert_srt_to_ass(const std::string& src) noexcept
         }
 
         if (!text.empty()) {
-            emit_dialogue(out, start_ms, end_ms, text);
+            // SRT in the wild frequently uses the same HTML-ish
+            // tag set as SAMI (<b>, <i>, <font color=...>). Run
+            // through the same stripper so formatting lands in
+            // ASS overrides instead of printing literal tags.
+            emit_dialogue(out, start_ms, end_ms, strip_html(text));
         }
     }
 
@@ -583,16 +611,191 @@ std::string convert_srt_to_ass(const std::string& src) noexcept
 // next SYNC begins (so we carry the "current text" forward and emit a
 // Dialogue event when it changes).
 
+// Parse an HTML colour value — `#RRGGBB`, bare `RRGGBB`, or one of
+// a small set of named colours. Fills `r/g/b` and returns true on
+// success. Values with surrounding quotes / whitespace are tolerated.
+bool parse_html_color(const std::string& raw,
+                      std::uint8_t& r, std::uint8_t& g,
+                      std::uint8_t& b) noexcept
+{
+    std::size_t lo = 0, hi = raw.size();
+    while (lo < hi && (raw[lo] == ' ' || raw[lo] == '\t'
+                       || raw[lo] == '"' || raw[lo] == '\'')) ++lo;
+    while (hi > lo && (raw[hi-1] == ' ' || raw[hi-1] == '\t'
+                       || raw[hi-1] == '"' || raw[hi-1] == '\'')) --hi;
+    std::string v = raw.substr(lo, hi - lo);
+    if (!v.empty() && v[0] == '#') v.erase(0, 1);
+
+    auto hex = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        return -1;
+    };
+
+    if (v.size() == 6) {
+        const int a1 = hex(v[0]), a2 = hex(v[1]);
+        const int b1 = hex(v[2]), b2 = hex(v[3]);
+        const int c1 = hex(v[4]), c2 = hex(v[5]);
+        if ((a1 | a2 | b1 | b2 | c1 | c2) < 0) return false;
+        r = static_cast<std::uint8_t>(a1 * 16 + a2);
+        g = static_cast<std::uint8_t>(b1 * 16 + b2);
+        b = static_cast<std::uint8_t>(c1 * 16 + c2);
+        return true;
+    }
+
+    std::string lv; lv.reserve(v.size());
+    for (char c : v) {
+        lv += static_cast<char>(
+            std::tolower(static_cast<unsigned char>(c)));
+    }
+    struct Named { const char* name; std::uint8_t r, g, b; };
+    static constexpr Named kNames[] = {
+        {"red",     255,   0,   0},
+        {"green",     0, 128,   0},
+        {"lime",      0, 255,   0},
+        {"blue",      0,   0, 255},
+        {"yellow",  255, 255,   0},
+        {"white",   255, 255, 255},
+        {"black",     0,   0,   0},
+        {"cyan",      0, 255, 255},
+        {"magenta", 255,   0, 255},
+        {"gray",    128, 128, 128},
+        {"grey",    128, 128, 128},
+        {"silver",  192, 192, 192},
+        {"orange",  255, 165,   0},
+        {"pink",    255, 192, 203},
+        {"purple",  128,   0, 128},
+        {"brown",   165,  42,  42},
+    };
+    for (const auto& n : kNames) {
+        if (lv == n.name) {
+            r = n.r; g = n.g; b = n.b;
+            return true;
+        }
+    }
+    return false;
+}
+
+// Pull a single attribute value out of a tag body (the bytes between
+// `<` and `>`, without the tag name). Returns the raw value with
+// original case preserved. Empty if the attribute is missing.
+std::string find_attr(const std::string& body, const char* name) noexcept
+{
+    std::string lb; lb.reserve(body.size());
+    for (char c : body) {
+        lb += static_cast<char>(
+            std::tolower(static_cast<unsigned char>(c)));
+    }
+    const std::size_t n = std::strlen(name);
+    std::size_t p = lb.find(name);
+    if (p == std::string::npos) return {};
+    p += n;
+    while (p < lb.size() && (lb[p] == ' ' || lb[p] == '\t')) ++p;
+    if (p >= lb.size() || lb[p] != '=') return {};
+    ++p;
+    while (p < lb.size() && (lb[p] == ' ' || lb[p] == '\t')) ++p;
+    char quote = 0;
+    if (p < body.size() && (body[p] == '"' || body[p] == '\'')) {
+        quote = body[p];
+        ++p;
+    }
+    const std::size_t start = p;
+    while (p < body.size()) {
+        const char c = body[p];
+        if (quote && c == quote) break;
+        if (!quote && (c == ' ' || c == '\t' || c == '/'
+                       || c == '>')) break;
+        ++p;
+    }
+    return body.substr(start, p - start);
+}
+
 std::string strip_html(const std::string& in) noexcept
 {
     std::string out;
     out.reserve(in.size());
-    bool in_tag = false;
+    bool        in_tag = false;
+    std::string tag_body;   // content between the last '<' and '>'
+
+    auto finish_tag = [&]() {
+        // Strip leading whitespace + optional '/' so both "<br>" and
+        // "</br>" are picked up. The tag name is the first run of
+        // letters that follows.
+        std::size_t j = 0;
+        bool is_close = false;
+        while (j < tag_body.size()
+               && (tag_body[j] == ' ' || tag_body[j] == '\t')) {
+            ++j;
+        }
+        if (j < tag_body.size() && tag_body[j] == '/') {
+            is_close = true;
+            ++j;
+        }
+        std::string name;
+        while (j < tag_body.size()
+               && tag_body[j] != ' ' && tag_body[j] != '\t'
+               && tag_body[j] != '/' && tag_body[j] != '>') {
+            name += static_cast<char>(
+                std::tolower(static_cast<unsigned char>(tag_body[j])));
+            ++j;
+        }
+
+        if (name == "br") {
+            // Line break — SAMI/SRT both use <br>/<br/>/</br>. Drop
+            // a newline into the output and let ass_escape turn it
+            // into ASS's \N later.
+            out += '\n';
+        } else if (name == "b") {
+            out += is_close ? "{\\b0}" : "{\\b1}";
+        } else if (name == "i") {
+            out += is_close ? "{\\i0}" : "{\\i1}";
+        } else if (name == "u") {
+            out += is_close ? "{\\u0}" : "{\\u1}";
+        } else if (name == "s" || name == "strike") {
+            out += is_close ? "{\\s0}" : "{\\s1}";
+        } else if (name == "font") {
+            if (is_close) {
+                // </font> resets to the track's default style. `\r`
+                // is the ASS reset-style override.
+                out += "{\\r}";
+            } else {
+                const std::string color_val = find_attr(tag_body, "color");
+                std::uint8_t r = 0, g = 0, b = 0;
+                if (!color_val.empty()
+                    && parse_html_color(color_val, r, g, b)) {
+                    // ASS colour literal is `&Hbbggrr&` — BGR order.
+                    char buf[24];
+                    std::snprintf(
+                        buf, sizeof(buf),
+                        "{\\c&H%02X%02X%02X&}",
+                        static_cast<int>(b),
+                        static_cast<int>(g),
+                        static_cast<int>(r));
+                    out += buf;
+                }
+                // `size=` / `face=` are intentionally ignored — our
+                // ASS style dictates size/font for consistency across
+                // files, and mapping <font size=N> to ASS `\fs`
+                // would break that.
+            }
+        }
+        // All other tags silently dropped.
+        tag_body.clear();
+    };
+
     for (std::size_t i = 0; i < in.size(); ++i) {
         const char c = in[i];
-        if (c == '<') { in_tag = true; continue; }
-        if (c == '>') { in_tag = false; continue; }
-        if (in_tag)   continue;
+        if (c == '<') { in_tag = true; tag_body.clear(); continue; }
+        if (c == '>') {
+            if (in_tag) finish_tag();
+            in_tag = false;
+            continue;
+        }
+        if (in_tag) {
+            tag_body += c;
+            continue;
+        }
         // Minimal HTML entity handling for the few that actually appear.
         if (c == '&') {
             if (in.compare(i, 6, "&nbsp;") == 0) { out += ' '; i += 5; continue; }
