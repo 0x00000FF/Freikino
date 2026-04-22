@@ -316,12 +316,12 @@ bool MediaSession::complete_open(std::unique_ptr<PendingOpen> p) noexcept
         const auto slash = p->path.find_last_of(L"\\/");
         const std::wstring basename =
             (slash == std::wstring::npos) ? p->path : p->path.substr(slash + 1);
-        window_->show_title_toast(basename);
 
-        // Try to pick up a sibling subtitle BEFORE the state toast
-        // might fire so `(Subtitled)` already applies on the first
-        // Playing/Paused pop.
+        // Load the sibling subtitle (if any) FIRST so the filename
+        // toast we pop immediately afterwards can annotate itself
+        // with "(Subtitled)" on the very first appearance.
         window_->auto_load_sibling_subtitle(p->path);
+        window_->show_title_toast(basename);
 
         // Audio-only: build the Track descriptor and flip the
         // visualizer on. A video source hides the visualizer

@@ -879,7 +879,16 @@ void MainWindow::show_title_toast(std::wstring text) noexcept
 {
     current_name_ = text;
     if (!incognito_) {
-        title_toast_.show(std::move(text));
+        // Annotate the filename toast with "(Subtitled)" when a
+        // sibling subtitle was picked up for this open. MediaSession
+        // runs auto_load_sibling_subtitle BEFORE calling this, so
+        // the very first toast after opening a video reflects the
+        // subtitle state on its own.
+        std::wstring display = text;
+        if (subtitle_overlay_.loaded()) {
+            display += L" (Subtitled)";
+        }
+        title_toast_.show(std::move(display));
     }
     refresh_title();
 }
@@ -893,13 +902,9 @@ void MainWindow::show_state_toast(
     case PlaybackController::Transition::Paused:  label = L"Paused";  break;
     case PlaybackController::Transition::Stopped: label = L"Stopped"; break;
     }
-    std::wstring text = label;
-    if (subtitle_overlay_.loaded()) {
-        text += L" (Subtitled)";
-    }
     // Bypass show_title_toast's incognito check — state changes are
     // about UI feedback, not file identity.
-    title_toast_.show(std::move(text));
+    title_toast_.show(label);
     transport_overlay_.bump_activity();
 }
 
