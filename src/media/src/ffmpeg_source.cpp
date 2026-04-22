@@ -861,6 +861,18 @@ std::string FFmpegSource::extract_subtitle_ass(int stream_index) const noexcept
         out.assign(kMinimalAssHeader);
     }
 
+    // Formats ms to "H:MM:SS.cc" — ASS's event-time format.
+    auto fmt_ass_time = [](std::string& dst, int64_t ms) {
+        if (ms < 0) ms = 0;
+        const int h  = static_cast<int>(ms / 3600000);
+        const int m  = static_cast<int>((ms / 60000) % 60);
+        const int s  = static_cast<int>((ms / 1000) % 60);
+        const int cs = static_cast<int>((ms / 10) % 100);
+        char buf[24];
+        std::snprintf(buf, sizeof(buf), "%d:%02d:%02d.%02d", h, m, s, cs);
+        dst.append(buf);
+    };
+
     AVPacketPtr pkt{av_packet_alloc()};
     if (!pkt) {
         return {};
@@ -870,6 +882,21 @@ std::string FFmpegSource::extract_subtitle_ass(int stream_index) const noexcept
             av_packet_unref(pkt.get());
             continue;
         }
+
+        // Packet-derived timings so we can synthesise the Start / End
+        // fields libass expects. AVSubtitle.start/end_display_time
+        // are ms offsets from the packet's pts.
+        int64_t pkt_pts_ms = 0;
+        if (pkt->pts != AV_NOPTS_VALUE) {
+            pkt_pts_ms = av_rescale_q(
+                pkt->pts, st->time_base, AVRational{1, 1000});
+        }
+        int64_t pkt_dur_ms = 0;
+        if (pkt->duration > 0) {
+            pkt_dur_ms = av_rescale_q(
+                pkt->duration, st->time_base, AVRational{1, 1000});
+        }
+
         AVSubtitle sub{};
         int got = 0;
         const int r = avcodec_decode_subtitle2(
@@ -879,15 +906,86 @@ std::string FFmpegSource::extract_subtitle_ass(int stream_index) const noexcept
             continue;
         }
         if (got != 0) {
-            for (unsigned i = 0; i < sub.num_rects; ++i) {
-                const AVSubtitleRect* rect = sub.rects[i];
+            int64_t start_ms = pkt_pts_ms
+                + static_cast<int64_t>(sub.start_display_time);
+            int64_t end_ms   = pkt_pts_ms
+                + static_cast<int64_t>(sub.end_display_time);
+            if (end_ms <= start_ms) {
+                // end_display_time wasn't populated; fall back to
+                // packet duration, then to a sensible default so the
+                // caption at least flashes on screen.
+                end_ms = start_ms + (pkt_dur_ms > 0 ? pkt_dur_ms : 2000);
+            }
+
+            for (unsigned ri = 0; ri < sub.num_rects; ++ri) {
+                const AVSubtitleRect* rect = sub.rects[ri];
                 if (rect == nullptr || rect->ass == nullptr) {
                     continue;
                 }
-                // `rect->ass` is already a full "Dialogue: ..." line
-                // from FFmpeg's ASS output formatter. Append as-is,
-                // ensuring a trailing newline.
-                out.append(rect->ass);
+
+                // `rect->ass` is the event *body*, not a full
+                // "Dialogue: …" line. Format, as produced by
+                // `ff_ass_add_rect`:
+                //   readorder,layer,style,name,marginL,marginR,marginV,effect,text
+                // libass expects
+                //   Dialogue: layer,Start,End,style,name,marginL,marginR,marginV,effect,text
+                // Parse out the body's 8 fields after readorder and
+                // splice the packet-derived Start / End in their
+                // rightful place. (Appending rect->ass verbatim was
+                // the bug that produced "0 events" in the log.)
+                const char* ras = rect->ass;
+                std::size_t len = std::strlen(ras);
+
+                // Skip the readorder field (first comma).
+                std::size_t p = 0;
+                while (p < len && ras[p] != ',') ++p;
+                if (p >= len) continue;
+                ++p; // past the comma
+
+                // Collect the next 7 comma offsets; the 8th field
+                // (text) is whatever remains and may itself contain
+                // commas.
+                std::size_t commas[7];
+                int found = 0;
+                for (std::size_t k = p; k < len && found < 7; ++k) {
+                    if (ras[k] == ',') {
+                        commas[found++] = k;
+                    }
+                }
+                if (found < 7) continue;
+
+                auto slice = [&](std::size_t a, std::size_t b) {
+                    return std::string(ras + a, b - a);
+                };
+                const std::string layer   = slice(p,            commas[0]);
+                const std::string style   = slice(commas[0]+1,  commas[1]);
+                const std::string name    = slice(commas[1]+1,  commas[2]);
+                const std::string marginL = slice(commas[2]+1,  commas[3]);
+                const std::string marginR = slice(commas[3]+1,  commas[4]);
+                const std::string marginV = slice(commas[4]+1,  commas[5]);
+                const std::string effect  = slice(commas[5]+1,  commas[6]);
+                const std::string text(ras + commas[6] + 1, len - commas[6] - 1);
+
+                out.append("Dialogue: ");
+                out.append(layer);
+                out.push_back(',');
+                fmt_ass_time(out, start_ms);
+                out.push_back(',');
+                fmt_ass_time(out, end_ms);
+                out.push_back(',');
+                out.append(style);
+                out.push_back(',');
+                out.append(name);
+                out.push_back(',');
+                out.append(marginL);
+                out.push_back(',');
+                out.append(marginR);
+                out.push_back(',');
+                out.append(marginV);
+                out.push_back(',');
+                out.append(effect);
+                out.push_back(',');
+                out.append(text);
                 if (out.empty() || out.back() != '\n') {
                     out.push_back('\n');
                 }
