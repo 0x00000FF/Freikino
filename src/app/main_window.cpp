@@ -1431,30 +1431,41 @@ std::vector<std::uint8_t> encode_rgba_to_png(
         return out;
     }
 
-    // Ask for RGBA (matches our source). If the PNG encoder
-    // negotiates a different format, it'll return one through the
-    // inout pointer and we'd need to convert — but PNG supports
-    // RGBA natively so this succeeds in practice.
-    WICPixelFormatGUID px = GUID_WICPixelFormat32bppRGBA;
+    // Ask for BGRA — the Windows PNG encoder's supported-format
+    // list includes 32bppBGRA but NOT 32bppRGBA, so requesting
+    // RGBA causes SetPixelFormat to silently renegotiate to BGRA
+    // and return that via the in-out pointer. Writing our RGBA
+    // data into a BGRA-configured frame produces a PNG with the
+    // red and blue channels swapped — the "skin is blue" symptom
+    // in pasted images. Request BGRA up front and convert the
+    // source to match.
+    WICPixelFormatGUID px = GUID_WICPixelFormat32bppBGRA;
     if (FAILED(frame->SetPixelFormat(&px))) {
         return out;
     }
+    if (!IsEqualGUID(px, GUID_WICPixelFormat32bppBGRA)) {
+        // Encoder picked yet another format; we don't have a
+        // converter path for it. Bail rather than emit mis-coloured
+        // pixels — the CF_DIB / CF_DIBV5 paths are still published.
+        log::warn("clipboard: PNG encoder chose unsupported pixel format");
+        return out;
+    }
 
-    // Copy + overwrite alpha so the PNG is opaque regardless of
-    // what the back buffer's unused alpha channel happened to hold.
-    std::vector<std::uint8_t> opaque(rgba.size());
+    // R8G8B8A8 (our source) → BGRA (what the encoder wants), with
+    // alpha forced opaque for the same reason as the DIB paths.
+    std::vector<std::uint8_t> bgra(rgba.size());
     for (std::size_t i = 0; i + 3 < pixel_bytes; i += 4) {
-        opaque[i + 0] = rgba[i + 0];
-        opaque[i + 1] = rgba[i + 1];
-        opaque[i + 2] = rgba[i + 2];
-        opaque[i + 3] = 0xFF;
+        bgra[i + 0] = rgba[i + 2]; // B ← src's B
+        bgra[i + 1] = rgba[i + 1]; // G
+        bgra[i + 2] = rgba[i + 0]; // R ← src's R
+        bgra[i + 3] = 0xFF;
     }
 
     const UINT stride = width * 4;
     if (FAILED(frame->WritePixels(
             height, stride,
             static_cast<UINT>(pixel_bytes),
-            opaque.data()))
+            bgra.data()))
         || FAILED(frame->Commit())
         || FAILED(encoder->Commit())) {
         return out;
