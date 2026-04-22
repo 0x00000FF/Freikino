@@ -326,7 +326,7 @@ bool PlaybackController::change_audio_track(int stream_index)
         presenter_->drop_lookahead();
     }
 
-    if (has_audio() && audio_ != nullptr && was_paused) {
+    if (has_audio() && audio_ != nullptr) {
         audio_->set_start_pts(resume_ns);
     } else if (!has_audio() && wall_clock_ != nullptr) {
         wall_clock_->set_now_ns(resume_ns);
@@ -402,21 +402,20 @@ void PlaybackController::seek_to(int64_t target_ns)
     // 5. Rebase the clock to the seek target.
     //    Wall-clock master: explicit set_now_ns (also honours a paused
     //    wall clock).
-    //    Audio master:
-    //      - Paused: set start_pts to target so now_ns() reads target
-    //        while the audio client is stopped. Without this, the
-    //        screen goes black because the presenter can't match any
-    //        frame against a clock stuck at 0.
-    //      - Playing: leave start_pts alone. The pump's first-sample
-    //        reseed (in fill_buffer) offsets by the current device
-    //        position, so the clock correctly reports the first
-    //        post-seek sample's pts at the moment it plays out — no
-    //        matter how long the decoder took to catch up from the
-    //        pre-target keyframe.
+    //    Audio master: set start_pts to target unconditionally. The
+    //    pump will still re-anchor on the first real sample (it keys
+    //    off `needs_reseed_`, which reset_for_seek raised), so the
+    //    final clock lands on the first post-seek sample's pts. But
+    //    in the meantime — while the decoder catches up from a
+    //    pre-target keyframe — `now_ns()` reports the seek target
+    //    instead of 0. Consumers that sample the clock during that
+    //    window (subtitle overlay, transport time readout, presenter
+    //    match window) now see a sensible time, so the subtitle
+    //    track doesn't flash its t=0 line on every seek.
     if (!has_audio() && wall_clock_ != nullptr) {
         wall_clock_->set_now_ns(target_ns);
     }
-    if (has_audio() && audio_ != nullptr && was_paused) {
+    if (has_audio() && audio_ != nullptr) {
         audio_->set_start_pts(target_ns);
     }
 

@@ -149,6 +149,17 @@ private:
     uint64_t                    clock_freq_          = 0;
     static constexpr int64_t    kStartPtsUnset = INT64_MIN;
     std::atomic<int64_t>        start_pts_ns_{kStartPtsUnset};
+    // When true, the pump will re-anchor `start_pts_ns_` against the
+    // pts of the first real audio sample it consumes (see
+    // `fill_buffer`). Set by `stop()` / `reset_for_seek()` so the
+    // next playback after a seek or teardown re-aligns. `now_ns()`
+    // treats this as "clock is stalled pending a real frame" and
+    // returns `start_pts_ns_` directly instead of adding the device
+    // position — otherwise the silence the pump writes while the
+    // decoder catches up would drift the reported time forward of
+    // reality, surfacing in the subtitle overlay as a flash of the
+    // t=0 line on every seek.
+    std::atomic<bool>           needs_reseed_{true};
 
     // Pump thread state.
     std::atomic<bool>           running_{false};

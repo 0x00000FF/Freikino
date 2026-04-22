@@ -490,10 +490,12 @@ void WasapiRenderer::stop() noexcept
         (void)client_->Reset();
     }
     // Clear clock baseline + residual so the next start() is a fresh
-    // session, not a resumption. The pump's first-frame offset reseed
-    // in fill_buffer checks for the kStartPtsUnset sentinel; leaving
-    // the stale value here breaks clock rebase on file change.
+    // session, not a resumption. The pump's first-frame reseed in
+    // fill_buffer keys off `needs_reseed_`; set it here too so a
+    // file replace (MediaSession close → open) re-anchors against
+    // the new file's first sample, not the stale previous timeline.
     start_pts_ns_.store(kStartPtsUnset, std::memory_order_release);
+    needs_reseed_.store(true, std::memory_order_release);
     residual_.clear();
     residual_offset_ = 0;
     // In case we were torn down mid-seek, clear the quiesce flag so a
@@ -543,6 +545,7 @@ void WasapiRenderer::reset_for_seek() noexcept
     (void)client_->Stop();
     (void)client_->Reset();
     start_pts_ns_.store(kStartPtsUnset, std::memory_order_release);
+    needs_reseed_.store(true, std::memory_order_release);
     residual_.clear();
     residual_offset_ = 0;
 }
@@ -623,6 +626,17 @@ int64_t WasapiRenderer::now_ns() const noexcept
     const int64_t start = start_pts_ns_.load(std::memory_order_acquire);
     if (start == kStartPtsUnset || !clock_ || clock_freq_ == 0) {
         return 0;
+    }
+    if (needs_reseed_.load(std::memory_order_acquire)) {
+        // Post-seek / post-start: the device clock will advance as the
+        // pump writes silence waiting for the decoder, but no real
+        // audio has played yet. Adding device position to `start`
+        // would drift the reported time ahead of reality, e.g.
+        // causing the subtitle overlay to jump to t=0 lines during
+        // the catch-up window. Hold at the seek target (what the
+        // caller stored via `set_start_pts`) until the pump reseeds
+        // against the first real sample.
+        return start;
     }
     UINT64 pos = 0;
     UINT64 qpc = 0;
@@ -771,8 +785,7 @@ void WasapiRenderer::fill_buffer(BYTE* dst, UINT32 frames_available) noexcept
         if (frame.samples.empty()) {
             continue;
         }
-        if (start_pts_ns_.load(std::memory_order_acquire)
-                == kStartPtsUnset) {
+        if (needs_reseed_.load(std::memory_order_acquire)) {
             // First real audio after open or seek. Subtract whatever
             // the device clock has advanced while we played silence
             // (decoder catch-up from a keyframe can run for seconds on
@@ -780,12 +793,6 @@ void WasapiRenderer::fill_buffer(BYTE* dst, UINT32 frames_available) noexcept
             // report this frame's pts at exactly this moment, so video
             // frames at the seek target aren't stranded "too late"
             // behind a clock that ran away during the catch-up.
-            //
-            // NOTE: the computed start_pts can legitimately be
-            // negative (when frame.pts_ns is small and the device
-            // already played a few hundred ms of silence). Do NOT
-            // change the sentinel to "-1" or any other plausible
-            // value — reseed would re-fire on every fill.
             int64_t pos_ns = 0;
             if (clock_ && clock_freq_ > 0) {
                 UINT64 pos = 0;
@@ -800,6 +807,7 @@ void WasapiRenderer::fill_buffer(BYTE* dst, UINT32 frames_available) noexcept
             }
             start_pts_ns_.store(
                 frame.pts_ns - pos_ns, std::memory_order_release);
+            needs_reseed_.store(false, std::memory_order_release);
         }
 
         const std::size_t remaining       = needed_samples - written;
