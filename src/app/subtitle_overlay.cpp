@@ -351,16 +351,24 @@ void SubtitleOverlay::toggle_track(std::size_t index) noexcept
         t->active      = !t->active;
         t->cache_dirty = true;
     } else {
-        if (!t->ever_loaded) {
-            if (!ensure_embedded_loaded(*t)) {
-                return;
-            }
+        // Embedded. On first activation we kick off an async
+        // extraction; the track becomes "active" from the user's
+        // perspective immediately, and captions start rendering as
+        // soon as draw() sees the future complete.
+        if (!t->ever_loaded && !t->extraction_attempted) {
+            start_embedded_extraction(*t);
+            t->active      = true;
+            t->cache_dirty = true;
+        } else {
+            t->active      = !t->active;
+            t->cache_dirty = true;
         }
-        t->active      = !t->active;
-        t->cache_dirty = true;
     }
 
-    // Refresh the display name with whatever's currently active.
+    // Refresh the display name with whatever's currently active and
+    // actually rendering. A track that's flagged active but still
+    // extracting doesn't count — the source line should reflect what
+    // the viewer can see.
     active_display_name_.clear();
     for (const auto& tr : tracks_) {
         if (tr && tr->active && tr->ever_loaded) {
@@ -370,39 +378,68 @@ void SubtitleOverlay::toggle_track(std::size_t index) noexcept
     }
 }
 
-bool SubtitleOverlay::ensure_embedded_loaded(Track& t) noexcept
+void SubtitleOverlay::start_embedded_extraction(Track& t) noexcept
 {
-    if (t.ever_loaded) {
-        return true;
+    if (t.ever_loaded || t.extraction_attempted
+        || t.extract_future.valid()) {
+        return;
     }
-    if (t.extraction_attempted) {
-        // A previous extraction failed — don't spin on it. The user
-        // can still toggle, but the track will stay inert.
-        return false;
+    if (source_ == nullptr || t.stream_index < 0) {
+        return;
     }
     t.extraction_attempted = true;
-    if (source_ == nullptr || t.stream_index < 0) {
-        return false;
+
+    media::FFmpegSource* src       = source_;
+    const int            stream_idx = t.stream_index;
+    // extract_subtitle_ass is a const method that opens its own
+    // AVFormatContext on the path stored in State — it doesn't touch
+    // `s_->fmt` (which the decode thread is demuxing live), so it's
+    // safe to run in a worker.
+    t.extract_future = std::async(
+        std::launch::async,
+        [src, stream_idx]() -> std::string {
+            if (src == nullptr || stream_idx < 0) return {};
+            return src->extract_subtitle_ass(stream_idx);
+        });
+}
+
+void SubtitleOverlay::poll_embedded_extractions() noexcept
+{
+    for (auto& tptr : tracks_) {
+        if (!tptr) continue;
+        Track& t = *tptr;
+        if (!t.extract_future.valid()) continue;
+        if (t.extract_future.wait_for(std::chrono::milliseconds(0))
+            != std::future_status::ready) {
+            continue;
+        }
+        std::string ass;
+        try {
+            ass = t.extract_future.get();
+        } catch (...) {
+            ass.clear();
+        }
+        if (ass.empty()) {
+            log::warn("subtitle: async extract empty / failed, stream {}",
+                      t.stream_index);
+            t.active = false;
+            continue;
+        }
+        if (!t.source) {
+            t.source = std::make_unique<subtitle::SubtitleSource>();
+        }
+        if (!t.renderer) {
+            t.renderer = std::make_unique<subtitle::SubtitleRenderer>();
+        }
+        if (!t.source->open_from_memory(std::move(ass), t.label)) {
+            t.active = false;
+            continue;
+        }
+        t.renderer->set_source(t.source.get());
+        t.ever_loaded = true;
+        t.cache_dirty = true;
+        apply_settings(t);
     }
-    std::string ass = source_->extract_subtitle_ass(t.stream_index);
-    if (ass.empty()) {
-        log::warn("subtitle: embedded extraction returned empty for stream {}",
-                  t.stream_index);
-        return false;
-    }
-    if (t.source == nullptr) {
-        t.source = std::make_unique<subtitle::SubtitleSource>();
-    }
-    if (t.renderer == nullptr) {
-        t.renderer = std::make_unique<subtitle::SubtitleRenderer>();
-    }
-    if (!t.source->open_from_memory(std::move(ass), t.label)) {
-        return false;
-    }
-    t.renderer->set_source(t.source.get());
-    t.ever_loaded = true;
-    apply_settings(t);
-    return true;
 }
 
 void SubtitleOverlay::apply_settings(Track& t) noexcept
@@ -439,6 +476,12 @@ const SubtitleOverlay::Track* SubtitleOverlay::external_track() const noexcept
 void SubtitleOverlay::draw(
     ID2D1DeviceContext* ctx, UINT w, UINT h) noexcept
 {
+    // Pick up any embedded-track extractions that completed since
+    // the last frame. Runs unconditionally (even before the nullptr
+    // / zero-dim checks below) so a paused-then-still-loading track
+    // still finalises when its worker finishes.
+    poll_embedded_extractions();
+
     if (ctx == nullptr || playback_ == nullptr) {
         return;
     }

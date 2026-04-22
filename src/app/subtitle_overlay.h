@@ -5,6 +5,7 @@
 #include "freikino/subtitle/subtitle_source.h"
 
 #include <cstddef>
+#include <future>
 #include <memory>
 #include <string>
 #include <vector>
@@ -141,6 +142,18 @@ private:
         bool         ever_loaded     = false;
         bool         extraction_attempted = false;
         std::wstring label;
+        // Pending async extraction of an embedded track's ASS
+        // document. The decode-thread-and-UI-blocking synchronous
+        // demux lived on the UI thread before; moving it off meant
+        // the caller-side toggle returns immediately, draw() polls
+        // this future each frame, and captions begin rendering as
+        // soon as the worker finishes. std::future's destructor
+        // (from std::launch::async) waits for the task, so tearing
+        // down a Track mid-extract is safe — the FFmpegSource the
+        // lambda captured by pointer is still alive at that point
+        // (clear() / set_source(nullptr) drop these Tracks before
+        // MediaSession destroys the source).
+        std::future<std::string> extract_future;
         // Vertical shift (screen px, upward = negative) applied to
         // every image's dst_y at draw time so stacked tracks don't
         // sit on the same row. Recomputed per frame from the rendered
@@ -155,10 +168,16 @@ private:
     // changes and before we enumerate tracks for the UI.
     void sync_embedded_tracks() noexcept;
 
-    // Bring an embedded track into the "loaded" state so it can be
-    // rendered. Extracts the ASS on first call; subsequent calls are
-    // no-ops. Returns true if the track is now loaded.
-    bool ensure_embedded_loaded(Track& t) noexcept;
+    // Kick off async extraction of an embedded track's ASS
+    // document. Safe to call multiple times — subsequent calls are
+    // no-ops while a prior attempt is in flight or completed.
+    void start_embedded_extraction(Track& t) noexcept;
+
+    // Poll pending extract_futures; for each one that's ready, load
+    // the extracted ASS into the track's source and mark it loaded.
+    // Runs at the top of every draw() frame — cheap when nothing is
+    // pending because wait_for(0) is essentially an atomic check.
+    void poll_embedded_extractions() noexcept;
 
     // Apply the current global settings (delay, font scale, font
     // override) to one track. Called when a track is (re)loaded.
