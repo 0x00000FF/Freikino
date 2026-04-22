@@ -190,6 +190,7 @@ bool SubtitleOverlay::load(const std::wstring& path)
                 break;
             }
         }
+        update_stack_positions();
         return true;
     }
 
@@ -214,6 +215,7 @@ bool SubtitleOverlay::load(const std::wstring& path)
 
     external_path_       = path;
     active_display_name_ = basename;
+    update_stack_positions();
     return true;
 }
 
@@ -273,6 +275,9 @@ void SubtitleOverlay::set_font_scale(float s) noexcept
             t->cache_dirty = true;
         }
     }
+    // Stack step tracks the font size so rows stay separated when
+    // the user scales captions up.
+    update_stack_positions();
 }
 
 void SubtitleOverlay::set_font_override(std::string family) noexcept
@@ -368,6 +373,7 @@ void SubtitleOverlay::toggle_track(std::size_t index) noexcept
             break;
         }
     }
+    update_stack_positions();
 }
 
 bool SubtitleOverlay::ensure_embedded_loaded(Track& t) noexcept
@@ -413,6 +419,28 @@ void SubtitleOverlay::apply_settings(Track& t) noexcept
     if (t.renderer) {
         t.renderer->set_font_scale(font_scale_);
         t.renderer->set_font_override(font_override_);
+    }
+}
+
+void SubtitleOverlay::update_stack_positions() noexcept
+{
+    // Stack step scales with the user's font-size override so the
+    // rows stay separated when captions grow. Clamp so extreme
+    // small-font settings don't produce barely-distinguishable rows.
+    const int step = (std::max)(
+        20, static_cast<int>(60.0f * font_scale_ + 0.5f));
+    int slot = 0;
+    for (auto& tptr : tracks_) {
+        if (!tptr) continue;
+        Track& t = *tptr;
+        if (!t.active || !t.ever_loaded || !t.source) {
+            // Deactivated tracks can stay at their last offset — they
+            // don't render, and the next activation will recompute.
+            continue;
+        }
+        t.source->set_margin_v_offset(slot * step);
+        t.cache_dirty = true;
+        ++slot;
     }
 }
 

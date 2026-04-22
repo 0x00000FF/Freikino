@@ -67,6 +67,13 @@ public:
     void     set_delay_ns(int64_t ns) noexcept;
     [[nodiscard]] int64_t delay_ns() const noexcept;
 
+    // Shift every style's MarginV by `delta_px` from its original
+    // (load-time) value. Used by the overlay to stack multiple
+    // simultaneously-active tracks above each other so their captions
+    // don't occupy the same baseline. Pass 0 to restore the original
+    // layout. No-op while no track is loaded.
+    void     set_margin_v_offset(int delta_px) noexcept;
+
 private:
     struct State;
     std::unique_ptr<State> s_;

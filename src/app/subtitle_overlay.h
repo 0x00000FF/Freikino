@@ -157,6 +157,13 @@ private:
     // override) to one track. Called when a track is (re)loaded.
     void apply_settings(Track& t) noexcept;
 
+    // Walk active tracks in list order and patch their styles'
+    // MarginV so the Nth active track renders above the one below
+    // it. Without this, every active renderer would anchor at the
+    // same default bottom-center margin and their captions would
+    // draw on top of each other.
+    void update_stack_positions() noexcept;
+
     // Find the external slot, or nullptr if none. External tracks are
     // kept in `tracks_[0]` by convention so `current_name()` + the
     // encoding-reload path can reach them cheaply.
