@@ -73,6 +73,13 @@ constexpr int64_t kStepLong  = 30LL * 1'000'000'000LL;
 // area" and can be dragged to move the window.
 constexpr int kTransportBarHeightPx = 96;
 
+// Timer id used to drive `presenter.render()` while Windows runs a
+// modal move/resize loop (WM_ENTERSIZEMOVE → WM_EXITSIZEMOVE). The
+// main-thread message pump is blocked during that loop, so the
+// waitable-object path in run() won't fire and playback would freeze
+// on the last-drawn frame without a timer to tick the presenter.
+constexpr UINT_PTR kSizeMoveTimerId = 0x2B01;
+
 } // namespace
 
 // Private window message used by MediaSession's background open
@@ -245,6 +252,33 @@ LRESULT MainWindow::on_message(UINT msg, WPARAM wparam, LPARAM lparam)
 
     case WM_SIZE:
         on_size(LOWORD(lparam), HIWORD(lparam));
+        return 0;
+
+    case WM_ENTERSIZEMOVE:
+        // Windows enters a modal internal loop while the user drags
+        // the title bar (move) or a resize handle. Our main message
+        // pump in run() is blocked for the duration. Install a timer
+        // so WM_TIMER still fires — modal loops dispatch timers — and
+        // we can keep rendering. Without this, the picture freezes
+        // on the pre-drag frame until the modal loop ends.
+        ::SetTimer(handle(), kSizeMoveTimerId, 16, nullptr);
+        return 0;
+
+    case WM_EXITSIZEMOVE:
+        ::KillTimer(handle(), kSizeMoveTimerId);
+        return 0;
+
+    case WM_TIMER:
+        if (wparam == kSizeMoveTimerId && presenter_created_) {
+            try {
+                presenter_.render();
+            } catch (const hresult_error& e) {
+                log::error(
+                    "render (sizemove): 0x{:08X}",
+                    static_cast<unsigned>(e.code()));
+            } catch (...) {
+            }
+        }
         return 0;
 
     case WM_PAINT: {
@@ -448,6 +482,13 @@ void MainWindow::on_size(UINT width, UINT height) noexcept
             overlay_renderer_.invalidate_target();
         }
         presenter_.resize(width, height);
+        // Repaint immediately so the aspect-correct viewport tracks the
+        // new swapchain dimensions within this message, not on the next
+        // main-loop tick. Without this, the frame held by the pipeline
+        // is stretched against the old viewport for one vsync interval
+        // after a resize — visible as a brief letterbox shift when the
+        // user releases the resize handle.
+        presenter_.render();
     } catch (const hresult_error& e) {
         log::error(
             "swapchain resize failed: 0x{:08X}",
