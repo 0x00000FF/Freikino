@@ -51,6 +51,30 @@ jobs:
           "VCPKG_ROOT=$env:VCPKG_INSTALLATION_ROOT" |
             Out-File -FilePath $env:GITHUB_ENV -Append
 
+      # Cache CMake's configure output (CMakeCache.txt, CMakeFiles,
+      # generated .sln/.vcxproj, vcpkg_installed tree, previous build
+      # .obj) keyed by everything the configure step actually reads:
+      # every CMakeLists in the tree, the presets file, the vcpkg
+      # manifest, and the shared cmake/ helpers. Source-file edits
+      # don't invalidate the key — CMake rechecks stamps on its own
+      # and skips re-generation when inputs are unchanged, so a
+      # warm cache cuts the Configure step from ~30 s (vcpkg
+      # manifest install + compiler probe + project gen) to a
+      # couple of seconds, and lets the subsequent Build reuse
+      # unchanged .obj files too.
+      #
+      # Matrix-config is part of the key (Debug and Release pick
+      # up different compile flags + distinct object dirs), and a
+      # restore-keys fallback matches any older entry for the same
+      # config so a CMakeLists tweak is still a warm-ish build.
+      - name: Cache CMake configure + build tree
+        uses: actions/cache@v4
+        with:
+          path: build/vs2022-x64
+          key: cmake-${{ runner.os }}-${{ matrix.config }}-${{ hashFiles('CMakeLists.txt', 'src/**/CMakeLists.txt', 'cmake/**', 'vcpkg.json', 'CMakePresets.json') }}
+          restore-keys: |
+            cmake-${{ runner.os }}-${{ matrix.config }}-
+
       - name: Configure
         shell: pwsh
         run: cmake --preset vs2022-x64
