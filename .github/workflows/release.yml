@@ -1,0 +1,95 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      upload_artifact_only:
+        description: "Upload artifact only (don't create a GitHub Release)"
+        type: boolean
+        default: true
+
+jobs:
+  windows-x64:
+    runs-on: windows-latest
+    permissions:
+      # softprops/action-gh-release needs contents:write to publish.
+      contents: write
+
+    env:
+      # Binary-cache vcpkg builds on the GHA cache backend so FFmpeg /
+      # libass don't rebuild from source each run. `x-gha,readwrite`
+      # needs ACTIONS_CACHE_URL + ACTIONS_RUNTIME_TOKEN exported by
+      # the step below — GHA doesn't expose those by default.
+      VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Export ACTIONS_CACHE_URL / ACTIONS_RUNTIME_TOKEN
+        uses: actions/github-script@v7
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL',
+              process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN',
+              process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+      - name: Point VCPKG_ROOT at the runner-bundled vcpkg
+        shell: pwsh
+        run: |
+          "VCPKG_ROOT=$env:VCPKG_INSTALLATION_ROOT" |
+            Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Configure
+        shell: pwsh
+        run: cmake --preset vs2022-x64
+
+      - name: Build (Release)
+        shell: pwsh
+        # POST_BUILD verify_binary.ps1 runs here — build fails if any
+        # exploit mitigation is missing or any forbidden UI-framework
+        # DLL sneaks in.
+        run: cmake --build build/vs2022-x64 --config Release --target freikino
+
+      - name: Stage artifacts
+        shell: pwsh
+        run: |
+          $stage = "stage/Freikino"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          $rel = "build/vs2022-x64/src/app/Release"
+          Copy-Item "$rel/Freikino.exe" -Destination $stage
+          # vcpkg's applocal deployment copies runtime DLLs next to
+          # the exe during build; pick up whatever's there.
+          Copy-Item "$rel/*.dll" -Destination $stage -ErrorAction SilentlyContinue
+          Copy-Item "LICENSE"   -Destination $stage -ErrorAction SilentlyContinue
+          Copy-Item "README.md" -Destination $stage -ErrorAction SilentlyContinue
+          Write-Host "Staged files:"
+          Get-ChildItem $stage | Format-Table Name, Length
+
+      - name: Package
+        shell: pwsh
+        run: |
+          Compress-Archive `
+            -Path stage/Freikino/* `
+            -DestinationPath Freikino-windows-x64.zip `
+            -Force
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Freikino-windows-x64
+          path: Freikino-windows-x64.zip
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Attach to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: Freikino-windows-x64.zip
+          draft: false
+          prerelease: false
+          generate_release_notes: true
