@@ -133,6 +133,7 @@ private:
     void refresh_title() noexcept;
     void toggle_fullscreen() noexcept;
     void toggle_incognito() noexcept;
+    void apply_incognito_icon() noexcept;
     void apply_dwm_chrome() noexcept;
     void pop_volume_osd() noexcept;
     // Taskbar thumbnail swap. `bgra` / `w` / `h` describe the album
@@ -183,6 +184,12 @@ private:
     // files that carry attached cover art. The HBITMAP is owned here
     // and destroyed in clear_album_thumbnail().
     HBITMAP                  album_thumb_bmp_   = nullptr;
+
+    // Icons extracted from explorer.exe while incognito is on. Owned
+    // here (ExtractIconExW → DestroyIcon). Cleared when incognito
+    // toggles off so the window falls back to the class icon.
+    HICON                    incognito_icon_big_   = nullptr;
+    HICON                    incognito_icon_small_ = nullptr;
 };
 
 } // namespace freikino::app

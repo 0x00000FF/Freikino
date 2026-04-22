@@ -86,6 +86,14 @@ MainWindow::~MainWindow()
         ::DeleteObject(album_thumb_bmp_);
         album_thumb_bmp_ = nullptr;
     }
+    if (incognito_icon_big_ != nullptr) {
+        ::DestroyIcon(incognito_icon_big_);
+        incognito_icon_big_ = nullptr;
+    }
+    if (incognito_icon_small_ != nullptr) {
+        ::DestroyIcon(incognito_icon_small_);
+        incognito_icon_small_ = nullptr;
+    }
 }
 
 void MainWindow::create(HINSTANCE instance)
@@ -789,7 +797,11 @@ void MainWindow::refresh_title() noexcept
         && playback_->state() == PlaybackController::State::paused;
 
     std::wstring title;
-    if (!incognito_ && !current_name_.empty()) {
+    if (incognito_) {
+        // Disguise as Windows Explorer — no filename, no paused
+        // suffix, nothing that would betray the player.
+        title = L"Windows Explorer";
+    } else if (!current_name_.empty()) {
         title = current_name_;
         if (paused) {
             title += L" (Paused)";
@@ -896,9 +908,56 @@ void MainWindow::toggle_incognito() noexcept
 {
     incognito_ = !incognito_;
     apply_dwm_chrome();
+    apply_incognito_icon();
     refresh_title();
     transport_overlay_.bump_activity();
     log::info("incognito: {}", incognito_ ? "on" : "off");
+}
+
+void MainWindow::apply_incognito_icon() noexcept
+{
+    HICON new_big   = nullptr;
+    HICON new_small = nullptr;
+
+    if (incognito_) {
+        // Pull the File Explorer icon straight out of explorer.exe.
+        // Composed from %SystemRoot% so it works no matter where
+        // Windows is installed.
+        wchar_t windir[MAX_PATH] = {};
+        const UINT n = ::GetWindowsDirectoryW(windir, MAX_PATH);
+        if (n > 0 && n < MAX_PATH) {
+            std::wstring exe_path{windir, n};
+            exe_path += L"\\explorer.exe";
+            (void)::ExtractIconExW(
+                exe_path.c_str(), 0, &new_big, &new_small, 1);
+        }
+    } else {
+        // On toggle-off, WM_SETICON NULL is not enough: once the
+        // taskbar has latched onto an explicit HICON it keeps
+        // showing it instead of falling back to the class icon.
+        // Install IDI_APPLICATION explicitly to force a refresh —
+        // that matches what the taskbar would show pre-incognito
+        // (our window class has no icon of its own). These are
+        // shared system icons so they must not be DestroyIcon'd.
+        new_big   = ::LoadIconW(nullptr, IDI_APPLICATION);
+        new_small = new_big;
+    }
+
+    ::SendMessageW(handle(), WM_SETICON, ICON_SMALL,
+        reinterpret_cast<LPARAM>(new_small));
+    ::SendMessageW(handle(), WM_SETICON, ICON_BIG,
+        reinterpret_cast<LPARAM>(new_big));
+
+    if (incognito_icon_big_ != nullptr) {
+        ::DestroyIcon(incognito_icon_big_);
+    }
+    if (incognito_icon_small_ != nullptr) {
+        ::DestroyIcon(incognito_icon_small_);
+    }
+    // Only record HICONs we own (from ExtractIconExW). IDI_APPLICATION
+    // is a shared system icon — don't stash it for later destruction.
+    incognito_icon_big_   = incognito_ ? new_big   : nullptr;
+    incognito_icon_small_ = incognito_ ? new_small : nullptr;
 }
 
 void MainWindow::pop_volume_osd() noexcept
