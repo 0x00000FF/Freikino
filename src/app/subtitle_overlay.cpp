@@ -505,8 +505,14 @@ void SubtitleOverlay::draw(
         Track& t = *tptr;
         if (!t.active || !t.ever_loaded || !t.renderer) continue;
 
+        // Must run every frame, not just on window resize: a newly
+        // activated track's renderer is freshly constructed with
+        // frame_w/h = 0 and would silently produce nothing until the
+        // next resize event nudged it. SubtitleRenderer::set_frame_size
+        // has an internal no-op guard for the unchanged-size case, so
+        // calling it unconditionally is cheap.
+        t.renderer->set_frame_size(last_w_, last_h_);
         if (size_changed) {
-            t.renderer->set_frame_size(last_w_, last_h_);
             t.cache_dirty = true;
         }
         const bool changed = t.renderer->render_at(now, t.images);
