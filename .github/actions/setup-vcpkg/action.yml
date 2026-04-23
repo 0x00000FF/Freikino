@@ -46,7 +46,7 @@ runs:
     # restore-keys fallback lets a manifest tweak still warm-start from a
     # previous install of the same feature set.
     - name: Cache vcpkg_installed
-      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+      uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
       with:
         path: vcpkg_installed
         key: vcpkg-installed-${{ runner.os }}-x64-windows-${{ inputs.features || 'default' }}-${{ hashFiles('vcpkg.json') }}
