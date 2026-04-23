@@ -45,7 +45,7 @@ jobs:
       # `v2-` prefix invalidates pre-relocation caches that still
       # contained vcpkg_installed inside the build tree.
       - name: Cache CMake build tree
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: build/vs2022-x64
           key: cmake-v2-${{ runner.os }}-${{ matrix.config }}-${{ hashFiles('CMakeLists.txt', 'src/**/CMakeLists.txt', 'cmake/**', 'vcpkg.json', 'CMakePresets.json') }}
@@ -75,7 +75,7 @@ jobs:
           features: tests
 
       - name: Cache CMake build tree
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: build/vs2022-x64-tests
           key: cmake-v2-tests-${{ runner.os }}-${{ hashFiles('CMakeLists.txt', 'src/**/CMakeLists.txt', 'tests/**/CMakeLists.txt', 'cmake/**', 'vcpkg.json', 'CMakePresets.json') }}
