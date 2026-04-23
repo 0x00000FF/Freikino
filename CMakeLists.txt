@@ -9,13 +9,9 @@ if(DEFINED CMAKE_TOOLCHAIN_FILE
     message(FATAL_ERROR
         "\n"
         "VCPKG_ROOT is not set in this shell, but the preset expects vcpkg.\n"
-        "Either:\n"
-        "  1. Set VCPKG_ROOT (PowerShell: `$env:VCPKG_ROOT = \"C:\\path\\to\\vcpkg\"`; "
-        "cmd: `set VCPKG_ROOT=C:\\path\\to\\vcpkg`), then re-run the preset.\n"
-        "  2. Build without FFmpeg/libass for now:\n"
-        "       cmake --preset vs2022-x64-no-deps\n"
-        "     (or plain `cmake -S . -B build -G \"Visual Studio 17 2022\" "
-        "-A x64 -DFREIKINO_WITH_MEDIA=OFF`)\n")
+        "Set VCPKG_ROOT and re-run the preset:\n"
+        "  PowerShell: `$env:VCPKG_ROOT = \"C:\\path\\to\\vcpkg\"`\n"
+        "  cmd:        `set VCPKG_ROOT=C:\\path\\to\\vcpkg`\n")
 endif()
 
 project(freikino

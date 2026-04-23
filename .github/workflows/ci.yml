@@ -112,20 +112,3 @@ jobs:
       - name: Run tests
         shell: pwsh
         run: ctest --test-dir build/vs2022-x64-tests -C Debug --output-on-failure
-
-  # Skeleton build (FREIKINO_WITH_MEDIA=OFF) so the no-deps preset
-  # doesn't bitrot. No vcpkg install path → fast, no binary cache
-  # needed.
-  build-no-deps:
-    name: Build (no-deps skeleton)
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Configure (no-deps)
-        shell: pwsh
-        run: cmake --preset vs2022-x64-no-deps
-
-      - name: Build (Release, no-deps)
-        shell: pwsh
-        run: cmake --build build/vs2022-x64-no-deps --config Release --target freikino

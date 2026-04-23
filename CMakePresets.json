@@ -28,17 +28,6 @@
       }
     },
     {
-      "name": "vs2022-x64-no-deps",
-      "displayName": "VS 2022 x64 (skeleton only, no FFmpeg/libass)",
-      "generator": "Visual Studio 17 2022",
-      "architecture": { "value": "x64", "strategy": "set" },
-      "toolset":      { "value": "host=x64", "strategy": "set" },
-      "binaryDir": "${sourceDir}/build/${presetName}",
-      "cacheVariables": {
-        "FREIKINO_WITH_MEDIA": "OFF"
-      }
-    },
-    {
       "name": "ninja-debug",
       "inherits": "base",
       "generator": "Ninja",
@@ -57,8 +46,6 @@
     { "name": "vs2022-x64-release",       "configurePreset": "vs2022-x64",         "configuration": "Release" },
     { "name": "vs2022-x64-tests-debug",   "configurePreset": "vs2022-x64-tests",   "configuration": "Debug" },
     { "name": "vs2022-x64-tests-release", "configurePreset": "vs2022-x64-tests",   "configuration": "Release" },
-    { "name": "vs2022-x64-no-deps-debug", "configurePreset": "vs2022-x64-no-deps", "configuration": "Debug" },
-    { "name": "vs2022-x64-no-deps-release","configurePreset": "vs2022-x64-no-deps","configuration": "Release" },
     { "name": "ninja-debug",        "configurePreset": "ninja-debug" },
     { "name": "ninja-release",      "configurePreset": "ninja-release" }
   ]
