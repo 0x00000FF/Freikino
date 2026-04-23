@@ -19,6 +19,15 @@
       "toolset":      { "value": "host=x64", "strategy": "set" }
     },
     {
+      "name": "vs2022-x64-tests",
+      "displayName": "VS 2022 x64 + unit tests (gtest)",
+      "inherits": "vs2022-x64",
+      "cacheVariables": {
+        "FREIKINO_BUILD_TESTS": "ON",
+        "VCPKG_MANIFEST_FEATURES": "tests"
+      }
+    },
+    {
       "name": "vs2022-x64-no-deps",
       "displayName": "VS 2022 x64 (skeleton only, no FFmpeg/libass)",
       "generator": "Visual Studio 17 2022",
@@ -46,6 +55,8 @@
   "buildPresets": [
     { "name": "vs2022-x64-debug",         "configurePreset": "vs2022-x64",         "configuration": "Debug" },
     { "name": "vs2022-x64-release",       "configurePreset": "vs2022-x64",         "configuration": "Release" },
+    { "name": "vs2022-x64-tests-debug",   "configurePreset": "vs2022-x64-tests",   "configuration": "Debug" },
+    { "name": "vs2022-x64-tests-release", "configurePreset": "vs2022-x64-tests",   "configuration": "Release" },
     { "name": "vs2022-x64-no-deps-debug", "configurePreset": "vs2022-x64-no-deps", "configuration": "Debug" },
     { "name": "vs2022-x64-no-deps-release","configurePreset": "vs2022-x64-no-deps","configuration": "Release" },
     { "name": "ninja-debug",        "configurePreset": "ninja-debug" },

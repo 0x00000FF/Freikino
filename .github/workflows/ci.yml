@@ -1,0 +1,131 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+# Newer pushes to a PR cancel in-flight runs of the same ref so we don't
+# burn CI minutes on superseded commits.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Full build with FFmpeg/libass via vcpkg. /W4 /WX is set in
+  # cmake/compile_options.cmake so any new warning fails the build, and
+  # the POST_BUILD verify_binary.ps1 step rejects the link if any
+  # exploit mitigation is missing or a forbidden UI-framework DLL has
+  # snuck into the import table.
+  build:
+    name: Build (${{ matrix.config }})
+    runs-on: windows-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        config: [Debug, Release]
+
+    env:
+      VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Export ACTIONS_CACHE_URL / ACTIONS_RUNTIME_TOKEN
+        uses: actions/github-script@v7
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL',
+              process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN',
+              process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+      - name: Point VCPKG_ROOT at the runner-bundled vcpkg
+        shell: pwsh
+        run: |
+          "VCPKG_ROOT=$env:VCPKG_INSTALLATION_ROOT" |
+            Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Cache CMake configure + build tree
+        uses: actions/cache@v4
+        with:
+          path: build/vs2022-x64
+          key: cmake-${{ runner.os }}-${{ matrix.config }}-${{ hashFiles('CMakeLists.txt', 'src/**/CMakeLists.txt', 'cmake/**', 'vcpkg.json', 'CMakePresets.json') }}
+          restore-keys: |
+            cmake-${{ runner.os }}-${{ matrix.config }}-
+
+      - name: Configure
+        shell: pwsh
+        run: cmake --preset vs2022-x64
+
+      - name: Build (${{ matrix.config }})
+        shell: pwsh
+        run: cmake --build build/vs2022-x64 --config ${{ matrix.config }} --target freikino
+
+  # GoogleTest unit tests. Uses the `vs2022-x64-tests` preset, which
+  # turns on FREIKINO_BUILD_TESTS and enables the `tests` vcpkg
+  # manifest feature so gtest is pulled in.
+  test:
+    name: Unit tests
+    runs-on: windows-latest
+
+    env:
+      VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Export ACTIONS_CACHE_URL / ACTIONS_RUNTIME_TOKEN
+        uses: actions/github-script@v7
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL',
+              process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN',
+              process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+      - name: Point VCPKG_ROOT at the runner-bundled vcpkg
+        shell: pwsh
+        run: |
+          "VCPKG_ROOT=$env:VCPKG_INSTALLATION_ROOT" |
+            Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Cache CMake configure + build tree
+        uses: actions/cache@v4
+        with:
+          path: build/vs2022-x64-tests
+          key: cmake-tests-${{ runner.os }}-${{ hashFiles('CMakeLists.txt', 'src/**/CMakeLists.txt', 'tests/**/CMakeLists.txt', 'cmake/**', 'vcpkg.json', 'CMakePresets.json') }}
+          restore-keys: |
+            cmake-tests-${{ runner.os }}-
+
+      - name: Configure
+        shell: pwsh
+        run: cmake --preset vs2022-x64-tests
+
+      - name: Build tests
+        shell: pwsh
+        run: cmake --build build/vs2022-x64-tests --config Debug --target freikino_tests
+
+      - name: Run tests
+        shell: pwsh
+        run: ctest --test-dir build/vs2022-x64-tests -C Debug --output-on-failure
+
+  # Skeleton build (FREIKINO_WITH_MEDIA=OFF) so the no-deps preset
+  # doesn't bitrot. No vcpkg install path → fast, no binary cache
+  # needed.
+  build-no-deps:
+    name: Build (no-deps skeleton)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure (no-deps)
+        shell: pwsh
+        run: cmake --preset vs2022-x64-no-deps
+
+      - name: Build (Release, no-deps)
+        shell: pwsh
+        run: cmake --build build/vs2022-x64-no-deps --config Release --target freikino

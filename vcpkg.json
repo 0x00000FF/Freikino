@@ -24,5 +24,11 @@
       ]
     },
     "libass"
-  ]
+  ],
+  "features": {
+    "tests": {
+      "description": "Build the GoogleTest-based unit test suite",
+      "dependencies": ["gtest"]
+    }
+  }
 }

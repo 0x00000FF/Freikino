@@ -42,3 +42,11 @@ list(APPEND CMAKE_MODULE_PATH "${CMAKE_SOURCE_DIR}/cmake")
 include(compile_options)
 
 add_subdirectory(src)
+
+# Tests are opt-in and pull gtest in via the `tests` vcpkg manifest
+# feature. The `vs2022-x64-tests` preset sets both together.
+option(FREIKINO_BUILD_TESTS "Build GoogleTest-based unit tests" OFF)
+if(FREIKINO_BUILD_TESTS)
+    enable_testing()
+    add_subdirectory(tests)
+endif()
