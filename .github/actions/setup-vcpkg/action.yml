@@ -1,0 +1,54 @@
+name: 'Set up vcpkg with caching'
+description: >
+  Wires VCPKG_ROOT, relocates vcpkg_installed/ to a workspace path so it can be
+  cached independently of the per-config build tree, exports the GHA binary
+  cache backend tokens, and restores the vcpkg_installed cache shared across
+  jobs that use the same triplet + manifest features.
+
+inputs:
+  features:
+    description: 'Comma-separated vcpkg manifest features to enable.'
+    required: false
+    default: ''
+
+runs:
+  using: composite
+  steps:
+    # All four jobs (build × {Debug,Release}, test, codeql) install the same
+    # FFmpeg+libass blob. Pulling vcpkg_installed/ out of the per-config build
+    # tree lets one cache entry serve all of them.
+    - name: Configure vcpkg env vars
+      shell: pwsh
+      run: |
+        @"
+        VCPKG_ROOT=$env:VCPKG_INSTALLATION_ROOT
+        VCPKG_INSTALLED_DIR=${{ github.workspace }}/vcpkg_installed
+        VCPKG_BINARY_SOURCES=clear;x-gha,readwrite
+        "@ | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+        if ('${{ inputs.features }}') {
+          "VCPKG_MANIFEST_FEATURES=${{ inputs.features }}" |
+            Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+        }
+
+    # Required by the `x-gha,readwrite` binary source above; GHA does not
+    # export these to step env by default.
+    - name: Export ACTIONS_CACHE_URL / ACTIONS_RUNTIME_TOKEN
+      uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+      with:
+        script: |
+          core.exportVariable('ACTIONS_CACHE_URL',
+            process.env.ACTIONS_CACHE_URL || '');
+          core.exportVariable('ACTIONS_RUNTIME_TOKEN',
+            process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+    # Key is config-independent: vcpkg_installed/ for x64-windows is identical
+    # for Debug and Release (vcpkg installs both variants in one tree). The
+    # restore-keys fallback lets a manifest tweak still warm-start from a
+    # previous install of the same feature set.
+    - name: Cache vcpkg_installed
+      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+      with:
+        path: vcpkg_installed
+        key: vcpkg-installed-${{ runner.os }}-x64-windows-${{ inputs.features || 'default' }}-${{ hashFiles('vcpkg.json') }}
+        restore-keys: |
+          vcpkg-installed-${{ runner.os }}-x64-windows-${{ inputs.features || 'default' }}-

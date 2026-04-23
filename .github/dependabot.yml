@@ -1,0 +1,38 @@
+version: 2
+
+# Dependabot handles the two ecosystems our repo actually tracks:
+#
+# 1. github-actions — every workflow pin (currently by SHA per the
+#    Scorecard PinnedDependencies requirement). Dependabot will PR a
+#    SHA bump whenever a used action publishes a new release, keeping
+#    the `# v4` / `# v7` comment consistent with the pinned hash.
+#
+# 2. the composite action under .github/actions/setup-vcpkg — picked
+#    up by a second `github-actions` entry so its internal `uses:`
+#    statements get the same treatment.
+#
+# Third-party C++ libraries come from vcpkg (see vcpkg.json). Dependabot
+# has no vcpkg ecosystem today; upgrades happen manually via the vcpkg
+# baseline + lockfile workflow.
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: ci
+      include: scope
+    labels:
+      - dependencies
+      - github-actions
+
+  - package-ecosystem: github-actions
+    directory: /.github/actions/setup-vcpkg
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: ci
+      include: scope
+    labels:
+      - dependencies
+      - github-actions

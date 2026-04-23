@@ -1,0 +1,19 @@
+name: Freikino CodeQL
+
+# CodeQL traces the compiler and analyses every translation unit the
+# build touches — which, for a vcpkg-driven media stack, pulls in
+# every third-party header we `#include` (ffmpeg, harfbuzz, freetype,
+# AMF, ffnvcodec, libpng, zlib). Those aren't our code to fix.
+#
+# `paths` scopes analysis to our own sources. `paths-ignore`
+# additionally strips any results that bubble up from build outputs.
+# Security queries still cover every symbol reachable from src/ and
+# tests/ — we're not weakening the analysis, just filtering findings
+# to the surface area we own.
+paths:
+  - src
+  - tests
+paths-ignore:
+  - build
+  - vs2022-x64
+  - '**/vcpkg_installed/**'
