@@ -7,6 +7,7 @@
 #include "playback.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <utility>
 
@@ -351,6 +352,7 @@ std::size_t SubtitleOverlay::track_count() const noexcept
 
 std::vector<SubtitleOverlay::TrackInfo> SubtitleOverlay::list_tracks() const
 {
+    const auto now = std::chrono::steady_clock::now();
     std::vector<TrackInfo> out;
     out.reserve(tracks_.size());
     for (const auto& t : tracks_) {
@@ -358,6 +360,25 @@ std::vector<SubtitleOverlay::TrackInfo> SubtitleOverlay::list_tracks() const
         TrackInfo info;
         info.active    = t->active && t->ever_loaded;
         info.available = t->available;
+        // Spinner rules:
+        //   * Brief post-click window (transition_end) so every toggle
+        //     feels acknowledged even when the underlying flip is
+        //     instant.
+        //   * For embedded tracks, until libass has its first batch
+        //     of events (ever_loaded). Capped at 2 s regardless: a
+        //     slow extractor shouldn't glue a spinner to the screen.
+        //     The extract keeps running in the background; the
+        //     checkbox just stops looking like it's waiting.
+        constexpr auto kExtractSpinnerCap = std::chrono::seconds(2);
+        const bool extract_pending =
+            t->extraction_attempted && !t->ever_loaded;
+        const bool within_extract_window =
+            extract_pending
+            && t->extraction_started_at
+                 != std::chrono::steady_clock::time_point{}
+            && (now - t->extraction_started_at) <= kExtractSpinnerCap;
+        const bool transition_pending = now < t->transition_end;
+        info.loading = within_extract_window || transition_pending;
         if (t->external) {
             info.label = L"external: ";
             if (t->label.empty()) {
@@ -385,6 +406,8 @@ void SubtitleOverlay::toggle_track(std::size_t index) noexcept
     if (t == nullptr || !t->available) {
         return;
     }
+    constexpr auto kToggleSpinner = std::chrono::milliseconds(220);
+    t->transition_end = std::chrono::steady_clock::now() + kToggleSpinner;
     if (t->external) {
         // External slot — requires a prior load(). Toggling only flips
         // the active flag; we don't re-extract anything.
@@ -423,66 +446,103 @@ void SubtitleOverlay::toggle_track(std::size_t index) noexcept
 
 void SubtitleOverlay::start_embedded_extraction(Track& t) noexcept
 {
-    if (t.ever_loaded || t.extraction_attempted
-        || t.extract_future.valid()) {
+    if (t.ever_loaded || t.extraction_attempted) {
         return;
     }
     if (source_ == nullptr || t.stream_index < 0) {
         return;
     }
-    t.extraction_attempted = true;
-
-    media::FFmpegSource* src       = source_;
-    const int            stream_idx = t.stream_index;
-    // extract_subtitle_ass is a const method that opens its own
-    // AVFormatContext on the path stored in State — it doesn't touch
-    // `s_->fmt` (which the decode thread is demuxing live), so it's
-    // safe to run in a worker.
-    t.extract_future = std::async(
-        std::launch::async,
-        [src, stream_idx]() -> std::string {
-            if (src == nullptr || stream_idx < 0) return {};
-            return src->extract_subtitle_ass(stream_idx);
-        });
+    // Background extractor was already kicked off by FFmpegSource at
+    // open(); this just flags the row so poll picks it up on the
+    // next frame and starts feeding the live snapshot to libass.
+    t.extraction_attempted  = true;
+    t.extraction_started_at = std::chrono::steady_clock::now();
+    t.next_refresh_at       = t.extraction_started_at;
 }
 
 void SubtitleOverlay::poll_embedded_extractions() noexcept
 {
+    if (source_ == nullptr) return;
+    const auto now = std::chrono::steady_clock::now();
+
     for (auto& tptr : tracks_) {
         if (!tptr) continue;
         Track& t = *tptr;
-        if (!t.extract_future.valid()) continue;
-        if (t.extract_future.wait_for(std::chrono::milliseconds(0))
-            != std::future_status::ready) {
+        if (t.external)              continue;
+        if (!t.extraction_attempted) continue;
+        if (t.extract_complete)      continue;
+        if (t.stream_index < 0)      continue;
+        if (now < t.next_refresh_at) continue;
+
+        const auto snap = source_->subtitle_snapshot(t.stream_index);
+
+        // Generation hasn't moved → no new bytes since last poll. If
+        // the extractor is also done, latch extract_complete so we
+        // stop polling forever.
+        if (snap.generation == t.last_loaded_generation) {
+            if (snap.complete) t.extract_complete = true;
+            t.next_refresh_at = now + std::chrono::milliseconds(400);
             continue;
         }
-        std::string ass;
-        try {
-            ass = t.extract_future.get();
-        } catch (...) {
-            ass.clear();
-        }
-        if (ass.empty()) {
-            log::warn("subtitle: async extract empty / failed, stream {}",
-                      t.stream_index);
-            t.active = false;
+
+        // Header isn't seeded yet — the background hasn't even
+        // primed the buffer. Try again very soon (this is the small
+        // first-frame window after open()).
+        if (snap.ass_text.empty()) {
+            t.next_refresh_at = now + std::chrono::milliseconds(80);
             continue;
         }
+
         if (!t.source) {
             t.source = std::make_unique<subtitle::SubtitleSource>();
         }
         if (!t.renderer) {
             t.renderer = std::make_unique<subtitle::SubtitleRenderer>();
         }
-        if (!t.source->open_from_memory(std::move(ass), t.label)) {
-            t.active = false;
-            continue;
+
+        if (!t.ever_loaded) {
+            // Initial load: hand libass the whole header + every
+            // event we have so far via open_from_memory.
+            if (!t.source->open_from_memory(
+                    std::string(snap.ass_text), t.label)) {
+                t.next_refresh_at = now + std::chrono::seconds(1);
+                continue;
+            }
+            apply_fonts(t);
+            t.renderer->set_source(t.source.get());
+            t.ever_loaded          = true;
+            t.cache_dirty          = true;
+            t.loaded_byte_count    = snap.ass_text.size();
+            t.last_loaded_generation = snap.generation;
+            apply_settings(t);
+            log::info("subtitle: stream {} initial load ({} bytes)",
+                      t.stream_index, t.loaded_byte_count);
+        } else {
+            // Incremental: only feed the BYTES PAST what we already
+            // have, and only up to the last newline so we never hand
+            // libass a half-event. ass_process_data appends; no
+            // re-parse, no cache flush.
+            if (snap.ass_text.size() > t.loaded_byte_count) {
+                const std::size_t hi = snap.ass_text.find_last_of(
+                    '\n', snap.ass_text.size() - 1);
+                if (hi != std::string::npos
+                    && hi + 1 > t.loaded_byte_count) {
+                    const std::size_t end = hi + 1;
+                    std::string_view delta(
+                        snap.ass_text.data() + t.loaded_byte_count,
+                        end - t.loaded_byte_count);
+                    t.source->append_ass_data(delta);
+                    t.loaded_byte_count      = end;
+                    t.last_loaded_generation = snap.generation;
+                }
+            }
         }
-        apply_fonts(t);
-        t.renderer->set_source(t.source.get());
-        t.ever_loaded = true;
-        t.cache_dirty = true;
-        apply_settings(t);
+
+        if (snap.complete
+            && t.loaded_byte_count >= snap.ass_text.size()) {
+            t.extract_complete = true;
+        }
+        t.next_refresh_at = now + std::chrono::milliseconds(400);
     }
 }
 

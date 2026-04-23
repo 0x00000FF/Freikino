@@ -78,6 +78,16 @@ public:
                       const std::uint8_t* data,
                       int size) noexcept;
 
+    // Append more ASS source bytes to the existing track via libass's
+    // `ass_process_data`. Used by the embedded-extractor incremental
+    // path: we hand libass just the new Dialogue lines instead of
+    // rebuilding the whole document, avoiding the per-refresh re-parse
+    // (and bitmap-cache flush) that an `open_from_memory` would cause.
+    // Caller must ensure `chunk` consists of *complete* lines —
+    // libass parses linewise and a half-line ends mid-event. Returns
+    // false when no track has been opened yet.
+    bool     append_ass_data(std::string_view chunk) noexcept;
+
 private:
     struct State;
     std::unique_ptr<State> s_;

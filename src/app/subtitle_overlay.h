@@ -4,6 +4,7 @@
 #include "freikino/subtitle/subtitle_renderer.h"
 #include "freikino/subtitle/subtitle_source.h"
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <future>
@@ -109,6 +110,7 @@ public:
         std::wstring label;        // user-facing one-liner
         bool         active;       // true = rendering right now
         bool         available;    // false = unsupported codec (greyed out)
+        bool         loading;      // true = mid-transition (spinner in UI)
     };
     [[nodiscard]] std::size_t           track_count() const noexcept;
     [[nodiscard]] std::vector<TrackInfo> list_tracks() const;
@@ -162,6 +164,30 @@ private:
         // list — a flat style-margin nudge was wrong for multi-line
         // captions.
         int          shift_y         = 0;
+        // Wall-clock deadline for the spinner-in-setup-UI. On a user
+        // toggle we push this `kToggleSpinnerMs` into the future so the
+        // UI renders a spinner for a tick after the click even when the
+        // underlying work is instant (external load / any unload) —
+        // otherwise clicks feel unacknowledged. An in-flight
+        // `extract_future` shows the spinner independently.
+        std::chrono::steady_clock::time_point transition_end{};
+        // When the async embedded extraction was kicked off. The
+        // spinner for the extract-pending state is capped 2 s past
+        // this stamp — long extracts shouldn't glue a spinner to the
+        // screen for minutes. The underlying work keeps running; the
+        // checkbox just stops looking like it's waiting.
+        std::chrono::steady_clock::time_point extraction_started_at{};
+        // Incremental extract bookkeeping. `last_loaded_generation`
+        // is the snapshot generation we last fed to libass; the next
+        // poll re-snapshots and feeds only the bytes past
+        // `loaded_byte_count` via `ass_process_data` (no re-parse,
+        // no bitmap-cache flush). `extract_complete` flips when the
+        // background extractor reaches EOF, after which polling
+        // stops. `next_refresh_at` throttles the poll cadence.
+        std::uint64_t                          last_loaded_generation = 0;
+        std::size_t                            loaded_byte_count      = 0;
+        bool                                   extract_complete       = false;
+        std::chrono::steady_clock::time_point  next_refresh_at{};
     };
 
     // Ensure each embedded stream in the bound source has a Track

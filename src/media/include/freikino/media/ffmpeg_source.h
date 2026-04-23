@@ -173,14 +173,29 @@ public:
     };
     [[nodiscard]] std::vector<FontAttachment> font_attachments() const noexcept;
 
-    // Pull the full dialogue history of a subtitle stream and return
-    // it as a self-contained ASS document (Script Info + V4+ Styles +
-    // Events). Opens a secondary AVFormatContext on the same file so
-    // the live playback demuxer isn't disturbed. Returns an empty
-    // string on failure (codec not decodable, stream not subtitle,
-    // I/O error). Runs synchronously on the caller's thread; typical
-    // cost is tens of milliseconds per track.
+    // Pull whatever the background extractor has decoded so far for
+    // a subtitle stream and return it as a self-contained ASS
+    // document (Script Info + V4+ Styles + accumulated Events).
+    // Non-blocking: grabs a consistent snapshot of the live buffer
+    // and returns immediately. Empty string until the extractor
+    // seeds the header. Use `subtitle_snapshot` for incremental
+    // refreshes — this convenience wrapper just returns the
+    // `ass_text` field.
     [[nodiscard]] std::string extract_subtitle_ass(int stream_index) const noexcept;
+
+    // Snapshot of one subtitle stream's accumulated state. Generation
+    // ticks up every time the background extractor appends new
+    // events; consumers compare against the previous generation and
+    // feed only the new bytes into libass via `ass_process_data`,
+    // avoiding a re-parse + bitmap-cache flush. `complete` flips on
+    // EOF — at that point the document won't grow further and
+    // consumers can stop polling.
+    struct SubtitleSnapshot {
+        std::string   ass_text;
+        std::uint64_t generation = 0;
+        bool          complete   = false;
+    };
+    [[nodiscard]] SubtitleSnapshot subtitle_snapshot(int stream_index) const noexcept;
 
     // Live metrics for the debug overlay.
     [[nodiscard]] std::size_t   video_queue_depth() const noexcept
@@ -225,6 +240,12 @@ private:
     std::atomic<bool> eos_{false};
 
     std::thread decode_thread_;
+
+    // Pre-extracts all text-based subtitle streams in one file pass at
+    // open() time, so `extract_subtitle_ass()` serves toggles from a
+    // completed future instead of re-reading the container every time.
+    // Joined in the destructor (signalled via State::subtitle_extract_cancel).
+    std::thread subtitle_extract_thread_;
 
     // Cumulative decoded counters. Incremented on each successful push
     // from the decode thread; read-only from other threads via the

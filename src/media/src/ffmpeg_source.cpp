@@ -1,16 +1,19 @@
 #include "freikino/media/ffmpeg_source.h"
 
+#include "matroska_subs.h"
+
 #include "freikino/common/error.h"
 #include "freikino/common/log.h"
 #include "freikino/common/strings.h"
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstring>
+#include <future>
 #include <memory>
-
-#include <chrono>
+#include <unordered_map>
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -128,6 +131,564 @@ ComPtr<ID3D11Texture2D> allocate_presentation_tex(
     return tex;
 }
 
+// Fallback ASS header used when a subtitle stream's codecpar lacks
+// its own Script Info + Styles block (typical for SRT / MovText).
+constexpr const char* kMinimalAssHeader =
+    "[Script Info]\n"
+    "ScriptType: v4.00+\n"
+    "WrapStyle: 0\n"
+    "ScaledBorderAndShadow: yes\n"
+    "PlayResX: 1920\n"
+    "PlayResY: 1080\n"
+    "\n"
+    "[V4+ Styles]\n"
+    "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour,"
+    " OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut,"
+    " ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow,"
+    " Alignment, MarginL, MarginR, MarginV, Encoding\n"
+    "Style: Default,Arial,48,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,"
+    "-1,0,0,0,100,100,0,0,1,2,1,2,20,20,40,1\n"
+    "\n"
+    "[Events]\n"
+    "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV,"
+    " Effect, Text\n";
+
+void append_ass_timestamp(std::string& dst, int64_t ms) noexcept
+{
+    if (ms < 0) ms = 0;
+    const int h  = static_cast<int>(ms / 3600000);
+    const int m  = static_cast<int>((ms / 60000) % 60);
+    const int s  = static_cast<int>((ms / 1000) % 60);
+    const int cs = static_cast<int>((ms / 10) % 100);
+    char buf[24];
+    std::snprintf(buf, sizeof(buf), "%d:%02d:%02d.%02d", h, m, s, cs);
+    dst.append(buf);
+}
+
+// Seed `out` with a Script Info + [V4+ Styles] block for the given
+// subtitle stream. Native ASS/SSA carry a full header in
+// codecpar->extradata; other codecs don't, so fall back to the
+// minimal template.
+void seed_ass_header_from_codecpar(
+    std::string& out, const AVStream* st)
+{
+    if (st != nullptr
+        && st->codecpar->extradata != nullptr
+        && st->codecpar->extradata_size > 0) {
+        out.assign(
+            reinterpret_cast<const char*>(st->codecpar->extradata),
+            static_cast<std::size_t>(st->codecpar->extradata_size));
+        // Some muxers terminate extradata after [V4+ Styles]; others
+        // include the [Events] header + Format line already. Append
+        // one only when missing — duplicating it makes libass ignore
+        // events after the second [Events] marker.
+        if (out.find("[Events]") == std::string::npos) {
+            out.append(
+                "\n[Events]\n"
+                "Format: Layer, Start, End, Style, Name, MarginL,"
+                " MarginR, MarginV, Effect, Text\n");
+        }
+        if (!out.empty() && out.back() != '\n') {
+            out.push_back('\n');
+        }
+    } else {
+        out.assign(kMinimalAssHeader);
+    }
+}
+
+// Turn one decoded AVSubtitleRect into an ASS "Dialogue:" line and
+// append to `out`. `rect->ass` is the ff_ass_add_rect body
+//   readorder,layer,style,name,marginL,marginR,marginV,effect,text
+// which we need to reshape into
+//   Dialogue: layer,Start,End,style,name,marginL,marginR,marginV,effect,text
+// with packet-derived Start / End. Verbatim-append was the original
+// bug that produced "0 events" in libass.
+void append_ass_dialogue_from_rect(
+    std::string& out,
+    const AVSubtitleRect* rect,
+    int64_t start_ms,
+    int64_t end_ms)
+{
+    if (rect == nullptr || rect->ass == nullptr) return;
+    const char* ras = rect->ass;
+    const std::size_t len = std::strlen(ras);
+
+    std::size_t p = 0;
+    while (p < len && ras[p] != ',') ++p;
+    if (p >= len) return;
+    ++p; // past the readorder comma
+
+    std::size_t commas[7];
+    int found = 0;
+    for (std::size_t k = p; k < len && found < 7; ++k) {
+        if (ras[k] == ',') {
+            commas[found++] = k;
+        }
+    }
+    if (found < 7) return;
+
+    auto slice = [&](std::size_t a, std::size_t b) {
+        return std::string(ras + a, b - a);
+    };
+    const std::string layer   = slice(p,            commas[0]);
+    const std::string style   = slice(commas[0]+1,  commas[1]);
+    const std::string name    = slice(commas[1]+1,  commas[2]);
+    const std::string marginL = slice(commas[2]+1,  commas[3]);
+    const std::string marginR = slice(commas[3]+1,  commas[4]);
+    const std::string marginV = slice(commas[4]+1,  commas[5]);
+    const std::string effect  = slice(commas[5]+1,  commas[6]);
+    const std::string text(ras + commas[6] + 1, len - commas[6] - 1);
+
+    out.append("Dialogue: ");
+    out.append(layer);
+    out.push_back(',');
+    append_ass_timestamp(out, start_ms);
+    out.push_back(',');
+    append_ass_timestamp(out, end_ms);
+    out.push_back(',');
+    out.append(style);
+    out.push_back(',');
+    out.append(name);
+    out.push_back(',');
+    out.append(marginL);
+    out.push_back(',');
+    out.append(marginR);
+    out.push_back(',');
+    out.append(marginV);
+    out.push_back(',');
+    out.append(effect);
+    out.push_back(',');
+    out.append(text);
+    if (out.empty() || out.back() != '\n') {
+        out.push_back('\n');
+    }
+}
+
+// Windows-native AVIO replacement for ffmpeg's file:// protocol. The
+// huge win over plain `avformat_open_input(path)` is opening the file
+// with `FILE_FLAG_SEQUENTIAL_SCAN`: the cache manager prefetches the
+// next megabytes ahead of every read, which absolutely crushes the
+// per-cluster latency that makes a sub-only matroska scan feel slow
+// (the demuxer reads thousands of small cluster headers, then skips
+// over the cluster bodies — exactly the access pattern Windows'
+// sequential prefetcher is built for). `OVERLAPPED`-with-offset is
+// used so each ReadFile is one syscall instead of a SetFilePointer
+// + ReadFile pair.
+class SeqReadIO {
+public:
+    explicit SeqReadIO(const std::wstring& path) noexcept
+    {
+        h_ = ::CreateFileW(
+            path.c_str(),
+            GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            nullptr,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN,
+            nullptr);
+    }
+    ~SeqReadIO()
+    {
+        if (h_ != INVALID_HANDLE_VALUE) {
+            ::CloseHandle(h_);
+        }
+    }
+    SeqReadIO(const SeqReadIO&)            = delete;
+    SeqReadIO& operator=(const SeqReadIO&) = delete;
+    SeqReadIO(SeqReadIO&&)                 = delete;
+    SeqReadIO& operator=(SeqReadIO&&)      = delete;
+
+    [[nodiscard]] bool valid() const noexcept
+    {
+        return h_ != INVALID_HANDLE_VALUE;
+    }
+
+    static int read_cb(void* opaque, std::uint8_t* buf, int buf_size) noexcept
+    {
+        auto* self = static_cast<SeqReadIO*>(opaque);
+        OVERLAPPED ov{};
+        ov.Offset     = static_cast<DWORD>(self->pos_ & 0xFFFFFFFFu);
+        ov.OffsetHigh = static_cast<DWORD>(
+            static_cast<std::uint64_t>(self->pos_) >> 32);
+        DWORD bytes_read = 0;
+        const BOOL ok = ::ReadFile(
+            self->h_, buf,
+            static_cast<DWORD>(buf_size),
+            &bytes_read, &ov);
+        if (!ok) {
+            const DWORD err = ::GetLastError();
+            if (err == ERROR_HANDLE_EOF) return AVERROR_EOF;
+            return AVERROR(EIO);
+        }
+        if (bytes_read == 0) return AVERROR_EOF;
+        self->pos_ += bytes_read;
+        return static_cast<int>(bytes_read);
+    }
+
+    static int64_t seek_cb(void* opaque, int64_t offset, int whence) noexcept
+    {
+        auto* self = static_cast<SeqReadIO*>(opaque);
+        if (whence == AVSEEK_SIZE) {
+            LARGE_INTEGER size;
+            if (!::GetFileSizeEx(self->h_, &size)) return -1;
+            return size.QuadPart;
+        }
+        std::int64_t new_pos = self->pos_;
+        switch (whence) {
+            case SEEK_SET: new_pos = offset; break;
+            case SEEK_CUR: new_pos = self->pos_ + offset; break;
+            case SEEK_END: {
+                LARGE_INTEGER size;
+                if (!::GetFileSizeEx(self->h_, &size)) return -1;
+                new_pos = size.QuadPart + offset;
+                break;
+            }
+            default: return -1;
+        }
+        if (new_pos < 0) return -1;
+        self->pos_ = new_pos;
+        return new_pos;
+    }
+
+private:
+    HANDLE       h_   = INVALID_HANDLE_VALUE;
+    std::int64_t pos_ = 0;
+};
+
+// Frees the AVIOContext + its buffer, in that order, on scope exit.
+// avformat_close_input does NOT touch the AVIOContext when
+// AVFMT_FLAG_CUSTOM_IO is set — that's the caller's job.
+struct AvioGuard {
+    AVIOContext* ctx = nullptr;
+    ~AvioGuard()
+    {
+        if (ctx != nullptr) {
+            av_freep(&ctx->buffer);
+            avio_context_free(&ctx);
+        }
+    }
+};
+
+// Per-stream live ASS buffer used by the incremental extractor path.
+// `header` is seeded once at startup; `events` grows as the
+// background scan decodes Dialogue lines. Each append bumps
+// `generation` while still under `mu` so a snapshot reader observes
+// a consistent (events, generation) pair. `complete` flips on EOF.
+struct SubLiveBuffer {
+    mutable std::mutex          mu;
+    std::string                 header;
+    std::string                 events;
+    std::atomic<bool>           complete{false};
+    std::atomic<std::uint64_t>  generation{0};
+};
+
+// One-shot background pass over the whole container that decodes all
+// text-based subtitle streams in a single file read and fulfils each
+// promise with the complete, ready-for-libass ASS document. The
+// blocking-once-on-completion model means consumers get a single
+// fully-formed document instead of incremental updates that would
+// thrash libass's parse + force the renderer to invalidate its cache
+// every refresh.
+void background_extract_text_subtitles(
+    std::string                                            path_utf8,
+    std::unordered_map<int, SubLiveBuffer*>                buffers,
+    const std::atomic<bool>&                               cancel,
+    std::atomic<std::int64_t>&                             seek_target_ns) noexcept
+{
+    // Run at Windows background priority (low CPU + low I/O) for the
+    // duration of the scan so we don't fight the decode thread for
+    // disk bandwidth. Video loading was slowing down when this
+    // thread and the decoder were both hammering the same HDD on
+    // open(). THREAD_MODE_BACKGROUND_END restores normal priority
+    // before we exit — important because some runtimes reuse std
+    // threads, and we don't want leftover low priority leaking out.
+    ::SetThreadPriority(::GetCurrentThread(),
+                        THREAD_MODE_BACKGROUND_BEGIN);
+    struct BgModeGuard {
+        ~BgModeGuard() {
+            ::SetThreadPriority(::GetCurrentThread(),
+                                THREAD_MODE_BACKGROUND_END);
+        }
+    } bg_guard;
+
+    auto mark_all_complete = [&]() {
+        for (auto& [_, buf] : buffers) {
+            if (buf == nullptr) continue;
+            buf->complete.store(true, std::memory_order_release);
+            buf->generation.fetch_add(1, std::memory_order_release);
+        }
+    };
+
+    if (cancel.load(std::memory_order_acquire) || buffers.empty()) {
+        mark_all_complete();
+        return;
+    }
+
+    // --- UTF-8 → UTF-16 path conversion (shared with both paths) -------
+    const int wlen_hdr = ::MultiByteToWideChar(
+        CP_UTF8, 0, path_utf8.data(),
+        static_cast<int>(path_utf8.size()), nullptr, 0);
+    std::wstring path_w_shared;
+    if (wlen_hdr > 0) {
+        path_w_shared.resize(static_cast<std::size_t>(wlen_hdr));
+        ::MultiByteToWideChar(
+            CP_UTF8, 0, path_utf8.data(),
+            static_cast<int>(path_utf8.size()),
+            path_w_shared.data(), wlen_hdr);
+    }
+
+    // Helper: dump a fully-built ASS document into the live buffer
+    // and bump its generation so consumers pick it up. Used by the
+    // matroska fast path (which produces the whole document in one
+    // go) so it integrates with the live-buffer model the consumers
+    // already follow.
+    auto publish_full_document =
+        [&](int idx, std::string ass_text) {
+            auto bit = buffers.find(idx);
+            if (bit == buffers.end() || bit->second == nullptr) return;
+            SubLiveBuffer* buf = bit->second;
+            std::lock_guard<std::mutex> lock(buf->mu);
+            buf->header.clear();
+            buf->events = std::move(ass_text);
+            buf->generation.fetch_add(1, std::memory_order_release);
+        };
+
+    // --- Fast path: direct Matroska Cues walk --------------------------
+    // Bypasses ffmpeg entirely for MKV files whose muxer indexed
+    // subtitle blocks in the Cues element. Reads ~tens of KB instead
+    // of the whole container. Returns false on non-MKV, no sub Cues,
+    // or any parsing issue; we fall through to the ffmpeg scan below.
+    if (!path_w_shared.empty()) {
+        std::unordered_map<int, std::string> quick;
+        if (detail::try_quick_extract_matroska_subs(
+                path_w_shared, quick, cancel)) {
+            for (auto& [idx, doc] : quick) {
+                publish_full_document(idx, std::move(doc));
+            }
+            mark_all_complete();
+            return;
+        }
+    }
+
+    // Open the file with our own Windows-native I/O so the kernel
+    // prefetcher kicks in (`FILE_FLAG_SEQUENTIAL_SCAN`) and each
+    // demuxer read pulls a 4 MB chunk instead of 32 KB. On a slow
+    // disk with a multi-GB container this is the difference between
+    // "minutes" and "seconds" of subtitle scan time.
+    if (path_w_shared.empty()) {
+        log::warn("sub-preextract: bad utf8 path");
+        mark_all_complete();
+        return;
+    }
+
+    auto io = std::make_unique<SeqReadIO>(path_w_shared);
+    if (!io->valid()) {
+        log::warn("sub-preextract: CreateFileW failed (gle={})",
+                  static_cast<unsigned long>(::GetLastError()));
+        mark_all_complete();
+        return;
+    }
+
+    constexpr int kIoBufBytes = 4 * 1024 * 1024; // 4 MB
+    auto* avio_buf = static_cast<unsigned char*>(av_malloc(kIoBufBytes));
+    if (avio_buf == nullptr) {
+        mark_all_complete();
+        return;
+    }
+    AvioGuard avio_guard;
+    avio_guard.ctx = avio_alloc_context(
+        avio_buf, kIoBufBytes,
+        0,                  // not write
+        io.get(),
+        &SeqReadIO::read_cb,
+        nullptr,
+        &SeqReadIO::seek_cb);
+    if (avio_guard.ctx == nullptr) {
+        av_free(avio_buf);
+        mark_all_complete();
+        return;
+    }
+
+    AVFormatContext* raw_fmt = avformat_alloc_context();
+    if (raw_fmt == nullptr) {
+        mark_all_complete();
+        return;
+    }
+    raw_fmt->pb     = avio_guard.ctx;
+    raw_fmt->flags |= AVFMT_FLAG_CUSTOM_IO;
+    if (avformat_open_input(&raw_fmt, nullptr, nullptr, nullptr) < 0
+        || raw_fmt == nullptr) {
+        log::warn("sub-preextract: open_input failed");
+        // raw_fmt was either freed by avformat_open_input on failure,
+        // or never assigned — nothing further to do for it.
+        mark_all_complete();
+        return;
+    }
+    AVFormatCtxPtr fmt{raw_fmt};
+
+    // `avformat_find_stream_info` is the other big time sink. Skip it
+    // when every target stream already has codec_id from open_input
+    // (MKV's tracks entry supplies it). Probe only as a fallback.
+    bool need_probe = false;
+    for (const auto& [idx, _] : buffers) {
+        if (idx < 0 || static_cast<unsigned>(idx) >= fmt->nb_streams) {
+            need_probe = true;
+            break;
+        }
+        const AVStream* st = fmt->streams[idx];
+        if (st->codecpar->codec_id == AV_CODEC_ID_NONE) {
+            need_probe = true;
+            break;
+        }
+    }
+    if (need_probe && avformat_find_stream_info(fmt.get(), nullptr) < 0) {
+        log::warn("sub-preextract: find_stream_info failed");
+        mark_all_complete();
+        return;
+    }
+
+    // AVDISCARD_ALL on every stream we don't care about cuts demuxer
+    // work to the bone — the file read still happens, but no packets
+    // get queued for the unrelated video / audio / attachment streams.
+    for (unsigned i = 0; i < fmt->nb_streams; ++i) {
+        const bool keep =
+            buffers.find(static_cast<int>(i)) != buffers.end();
+        fmt->streams[i]->discard =
+            keep ? AVDISCARD_DEFAULT : AVDISCARD_ALL;
+    }
+
+    // Seed each live buffer's header now so the very first poll from
+    // the UI side has *something* to hand to libass — even an empty
+    // event list parses cleanly. Any decoded events get appended
+    // straight into `events` below.
+    for (auto& [idx, buf] : buffers) {
+        if (buf == nullptr) continue;
+        AVStream* st = fmt->streams[idx];
+        std::string hdr;
+        seed_ass_header_from_codecpar(hdr, st);
+        std::lock_guard<std::mutex> lock(buf->mu);
+        buf->header = std::move(hdr);
+        buf->generation.fetch_add(1, std::memory_order_release);
+    }
+
+    struct StreamCtx {
+        AVCodecCtxPtr  codec;
+        SubLiveBuffer* buf        = nullptr;  // non-owning
+        bool           decoder_ok = false;
+    };
+    std::unordered_map<int, StreamCtx> ctxs;
+    ctxs.reserve(buffers.size());
+    for (const auto& [idx, buf] : buffers) {
+        AVStream* st = fmt->streams[idx];
+        StreamCtx sc;
+        sc.buf = buf;
+
+        const AVCodec* decoder =
+            avcodec_find_decoder(st->codecpar->codec_id);
+        if (decoder != nullptr) {
+            AVCodecContext* raw_codec = avcodec_alloc_context3(decoder);
+            if (raw_codec != nullptr) {
+                AVCodecCtxPtr codec{raw_codec};
+                if (avcodec_parameters_to_context(codec.get(), st->codecpar) >= 0
+                    && avcodec_open2(codec.get(), decoder, nullptr) >= 0) {
+                    sc.codec      = std::move(codec);
+                    sc.decoder_ok = true;
+                }
+            }
+        }
+        ctxs.emplace(idx, std::move(sc));
+    }
+
+    AVPacketPtr pkt{av_packet_alloc()};
+    if (!pkt) {
+        mark_all_complete();
+        return;
+    }
+
+    log::info("sub-extract: scan started");
+    while (!cancel.load(std::memory_order_acquire)) {
+        // Honour a pending playback seek: skip ahead in our own
+        // AVFormatContext so we stop wasting time scanning clusters
+        // the user already passed. `exchange(-1)` is an atomic
+        // latest-wins take — repeated seeks before we service them
+        // collapse to the most recent target.
+        const std::int64_t pending_ns =
+            seek_target_ns.exchange(-1, std::memory_order_acq_rel);
+        if (pending_ns >= 0) {
+            const int64_t ts = av_rescale_q(
+                pending_ns,
+                AVRational{1, 1'000'000'000},
+                AVRational{1, AV_TIME_BASE});
+            // AVSEEK_FLAG_BACKWARD lands at the keyframe at-or-before
+            // the target — safe for either direction because sub
+            // streams are all keyframes; we just want to relocate the
+            // demuxer cursor. stream_index=-1 lets ffmpeg pick a
+            // reference stream (typically video) whose index is best.
+            const int rc = av_seek_frame(
+                fmt.get(), -1, ts, AVSEEK_FLAG_BACKWARD);
+            log::info("sub-extract: seek -> {} ms (rc={})",
+                      pending_ns / 1'000'000, rc);
+        }
+
+        if (av_read_frame(fmt.get(), pkt.get()) < 0) break;
+        auto it = ctxs.find(pkt->stream_index);
+        if (it == ctxs.end() || !it->second.decoder_ok) {
+            av_packet_unref(pkt.get());
+            continue;
+        }
+        StreamCtx& sc = it->second;
+        AVStream*  st = fmt->streams[pkt->stream_index];
+
+        int64_t pkt_pts_ms = 0;
+        if (pkt->pts != AV_NOPTS_VALUE) {
+            pkt_pts_ms = av_rescale_q(
+                pkt->pts, st->time_base, AVRational{1, 1000});
+        }
+        int64_t pkt_dur_ms = 0;
+        if (pkt->duration > 0) {
+            pkt_dur_ms = av_rescale_q(
+                pkt->duration, st->time_base, AVRational{1, 1000});
+        }
+
+        AVSubtitle sub{};
+        int got = 0;
+        const int r = avcodec_decode_subtitle2(
+            sc.codec.get(), &sub, &got, pkt.get());
+        av_packet_unref(pkt.get());
+        if (r < 0 || got == 0) {
+            if (r >= 0) avsubtitle_free(&sub);
+            continue;
+        }
+
+        int64_t start_ms = pkt_pts_ms
+            + static_cast<int64_t>(sub.start_display_time);
+        int64_t end_ms   = pkt_pts_ms
+            + static_cast<int64_t>(sub.end_display_time);
+        if (end_ms <= start_ms) {
+            end_ms = start_ms
+                + (pkt_dur_ms > 0 ? pkt_dur_ms : 2000);
+        }
+
+        // Format outside the lock — string building doesn't need to
+        // hold readers off — then a single append-under-lock makes
+        // the new bytes visible alongside the matching generation
+        // bump.
+        std::string lines;
+        for (unsigned ri = 0; ri < sub.num_rects; ++ri) {
+            append_ass_dialogue_from_rect(
+                lines, sub.rects[ri], start_ms, end_ms);
+        }
+        avsubtitle_free(&sub);
+        if (lines.empty() || sc.buf == nullptr) continue;
+        std::lock_guard<std::mutex> lock(sc.buf->mu);
+        sc.buf->events.append(lines);
+        sc.buf->generation.fetch_add(1, std::memory_order_release);
+    }
+
+    log::info("sub-extract: scan complete ({} stream(s))", ctxs.size());
+    mark_all_complete();
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -175,6 +736,24 @@ struct FFmpegSource::State {
     // secondary AVFormatContext without having to thread the wide
     // path through.
     std::string                 source_path_utf8;
+
+    // Live ASS buffer per text-subtitle stream — see SubLiveBuffer
+    // definition at file scope. The background extractor appends
+    // Dialogue lines into the buffer's `events` and bumps the
+    // generation so consumers can detect and incrementally feed the
+    // new bytes into libass via `ass_process_data` (no re-parse, no
+    // flicker).
+    std::unordered_map<int, std::unique_ptr<SubLiveBuffer>>
+                                subtitle_live_buffers;
+    // Set by ~FFmpegSource before joining the background thread so the
+    // read loop can bail out of a long container scan instead of making
+    // file close wait for EOF.
+    std::atomic<bool>           subtitle_extract_cancel{false};
+    // Last playback seek target in ns, relayed by `seek_while_stopped`
+    // to the background extractor so it abandons work on the region
+    // the user already skipped past. -1 means "no pending seek".
+    // The extractor `exchange`s this out, latest-wins semantics.
+    std::atomic<std::int64_t>   subtitle_extract_seek_ns{-1};
 
     // Lower bound (with margin) for which frames to push after a seek.
     // `avformat_seek_file` with AVSEEK_FLAG_BACKWARD lands at the
@@ -279,6 +858,12 @@ FFmpegSource::FFmpegSource(
 FFmpegSource::~FFmpegSource()
 {
     stop();
+    if (s_) {
+        s_->subtitle_extract_cancel.store(true, std::memory_order_release);
+    }
+    if (subtitle_extract_thread_.joinable()) {
+        subtitle_extract_thread_.join();
+    }
 }
 
 int64_t FFmpegSource::duration_ns() const noexcept
@@ -684,6 +1269,30 @@ void FFmpegSource::open(const std::wstring& path)
         }
         s_->fmt->streams[i]->discard = AVDISCARD_ALL;
     }
+
+    // ---- Pre-extract text subtitles in the background ----
+    // Allocates a per-stream live buffer and hands non-owning pointers
+    // to a worker that scans the container, appending Dialogue lines
+    // as it goes. `subtitle_snapshot` returns the buffer's current
+    // state non-blocking, so the UI can hand the first events to
+    // libass within a frame and append more via `ass_process_data`
+    // as the scan progresses — no spinner glued to the screen.
+    std::unordered_map<int, SubLiveBuffer*> buffer_ptrs;
+    for (const auto& st : s_->subtitle_tracks) {
+        if (!st.is_text || st.stream_index < 0) continue;
+        auto buf = std::make_unique<SubLiveBuffer>();
+        buffer_ptrs.emplace(st.stream_index, buf.get());
+        s_->subtitle_live_buffers.emplace(
+            st.stream_index, std::move(buf));
+    }
+    if (!buffer_ptrs.empty()) {
+        subtitle_extract_thread_ = std::thread(
+            &background_extract_text_subtitles,
+            s_->source_path_utf8,
+            std::move(buffer_ptrs),
+            std::cref(s_->subtitle_extract_cancel),
+            std::ref(s_->subtitle_extract_seek_ns));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -727,6 +1336,17 @@ void FFmpegSource::seek_while_stopped(int64_t target_ns) noexcept
     // from the keyframe window before it (they'd be dropped downstream
     // as too-late anyway). See `kSeekLateMarginNs` in `decode_loop`.
     s_->seek_target_ns = target_ns < 0 ? 0 : target_ns;
+
+    // Relay the seek to the background subtitle extractor so it drops
+    // its cursor onto the same region instead of burning cycles
+    // scanning clusters the user already passed. Harmless if the
+    // extractor has already finished (its thread has exited and the
+    // atomic just gets ignored).
+    const int64_t sub_seek_ns = target_ns < 0 ? 0 : target_ns;
+    s_->subtitle_extract_seek_ns.store(
+        sub_seek_ns, std::memory_order_release);
+    log::info("sub-extract: relay playback seek to {} ms",
+              sub_seek_ns / 1'000'000);
 
     // Speed up the keyframe→target catch-up by discarding B-frames
     // until we reach the target. SW decoders skip the expensive
@@ -801,251 +1421,32 @@ FFmpegSource::font_attachments() const noexcept
     return s_ ? s_->font_attachments : std::vector<FontAttachment>{};
 }
 
+FFmpegSource::SubtitleSnapshot
+FFmpegSource::subtitle_snapshot(int stream_index) const noexcept
+{
+    SubtitleSnapshot snap;
+    if (!s_ || stream_index < 0) return snap;
+    auto it = s_->subtitle_live_buffers.find(stream_index);
+    if (it == s_->subtitle_live_buffers.end() || !it->second) {
+        return snap;
+    }
+    SubLiveBuffer* buf = it->second.get();
+    // Read everything under the lock so events / generation come out
+    // self-consistent — the writer side bumps generation while still
+    // holding the lock, so a generation observed here can never
+    // describe events that aren't already concatenated.
+    std::lock_guard<std::mutex> lock(buf->mu);
+    snap.ass_text.reserve(buf->header.size() + buf->events.size());
+    snap.ass_text  = buf->header;
+    snap.ass_text += buf->events;
+    snap.generation = buf->generation.load(std::memory_order_acquire);
+    snap.complete   = buf->complete.load(std::memory_order_acquire);
+    return snap;
+}
+
 std::string FFmpegSource::extract_subtitle_ass(int stream_index) const noexcept
 {
-    if (!s_ || s_->source_path_utf8.empty() || stream_index < 0) {
-        return {};
-    }
-
-    // Open a dedicated AVFormatContext on the same file. We can't
-    // reuse `s_->fmt` because the decode thread is actively demuxing
-    // from it; sharing would race av_read_frame with the pump. The
-    // per-call open is cheap compared to the subtitle decode itself
-    // and keeps the playback path untouched.
-    AVFormatContext* raw_fmt = nullptr;
-    if (avformat_open_input(
-            &raw_fmt, s_->source_path_utf8.c_str(), nullptr, nullptr) < 0
-        || raw_fmt == nullptr) {
-        log::warn("subtitle extract: open_input failed");
-        return {};
-    }
-    AVFormatCtxPtr fmt{raw_fmt};
-
-    if (avformat_find_stream_info(fmt.get(), nullptr) < 0) {
-        log::warn("subtitle extract: find_stream_info failed");
-        return {};
-    }
-    if (static_cast<unsigned>(stream_index) >= fmt->nb_streams) {
-        return {};
-    }
-    AVStream* st = fmt->streams[stream_index];
-    if (st == nullptr
-        || st->codecpar->codec_type != AVMEDIA_TYPE_SUBTITLE) {
-        return {};
-    }
-
-    // Discard everything else so av_read_frame skips video/audio
-    // packets entirely — massive speedup on long files where the
-    // subtitle track is just a handful of KB of events.
-    for (unsigned i = 0; i < fmt->nb_streams; ++i) {
-        fmt->streams[i]->discard =
-            (static_cast<int>(i) == stream_index)
-                ? AVDISCARD_DEFAULT
-                : AVDISCARD_ALL;
-    }
-
-    const AVCodec* decoder =
-        avcodec_find_decoder(st->codecpar->codec_id);
-    if (decoder == nullptr) {
-        log::warn("subtitle extract: no decoder for codec_id={}",
-                  static_cast<int>(st->codecpar->codec_id));
-        return {};
-    }
-    AVCodecContext* raw_codec = avcodec_alloc_context3(decoder);
-    if (raw_codec == nullptr) {
-        return {};
-    }
-    AVCodecCtxPtr codec{raw_codec};
-    if (avcodec_parameters_to_context(codec.get(), st->codecpar) < 0
-        || avcodec_open2(codec.get(), decoder, nullptr) < 0) {
-        log::warn("subtitle extract: codec open failed");
-        return {};
-    }
-
-    // Header: native ASS streams carry a full Script Info + Styles
-    // block in `codecpar->extradata`; reuse it verbatim so style
-    // definitions referenced by dialogue events still resolve. For
-    // every other codec, FFmpeg's internal "ass" output format emits
-    // events that reference a "Default" style, so a minimal standard
-    // header is sufficient.
-    constexpr const char* kMinimalAssHeader =
-        "[Script Info]\n"
-        "ScriptType: v4.00+\n"
-        "WrapStyle: 0\n"
-        "ScaledBorderAndShadow: yes\n"
-        "PlayResX: 1920\n"
-        "PlayResY: 1080\n"
-        "\n"
-        "[V4+ Styles]\n"
-        "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour,"
-        " OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut,"
-        " ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow,"
-        " Alignment, MarginL, MarginR, MarginV, Encoding\n"
-        "Style: Default,Arial,48,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,"
-        "-1,0,0,0,100,100,0,0,1,2,1,2,20,20,40,1\n"
-        "\n"
-        "[Events]\n"
-        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV,"
-        " Effect, Text\n";
-
-    std::string out;
-    if (st->codecpar->extradata != nullptr
-        && st->codecpar->extradata_size > 0) {
-        out.assign(
-            reinterpret_cast<const char*>(st->codecpar->extradata),
-            static_cast<std::size_t>(st->codecpar->extradata_size));
-        // Some container packagings already end the extradata with the
-        // "[Events]" header + Format line; others stop after [V4+
-        // Styles]. Normalize by appending an Events header iff the
-        // extradata didn't include one — otherwise we'd duplicate it
-        // and libass ignores everything after the second [Events].
-        if (out.find("[Events]") == std::string::npos) {
-            out.append(
-                "\n[Events]\n"
-                "Format: Layer, Start, End, Style, Name, MarginL, MarginR,"
-                " MarginV, Effect, Text\n");
-        }
-        if (!out.empty() && out.back() != '\n') {
-            out.push_back('\n');
-        }
-    } else {
-        out.assign(kMinimalAssHeader);
-    }
-
-    // Formats ms to "H:MM:SS.cc" — ASS's event-time format.
-    auto fmt_ass_time = [](std::string& dst, int64_t ms) {
-        if (ms < 0) ms = 0;
-        const int h  = static_cast<int>(ms / 3600000);
-        const int m  = static_cast<int>((ms / 60000) % 60);
-        const int s  = static_cast<int>((ms / 1000) % 60);
-        const int cs = static_cast<int>((ms / 10) % 100);
-        char buf[24];
-        std::snprintf(buf, sizeof(buf), "%d:%02d:%02d.%02d", h, m, s, cs);
-        dst.append(buf);
-    };
-
-    AVPacketPtr pkt{av_packet_alloc()};
-    if (!pkt) {
-        return {};
-    }
-    while (av_read_frame(fmt.get(), pkt.get()) >= 0) {
-        if (pkt->stream_index != stream_index) {
-            av_packet_unref(pkt.get());
-            continue;
-        }
-
-        // Packet-derived timings so we can synthesise the Start / End
-        // fields libass expects. AVSubtitle.start/end_display_time
-        // are ms offsets from the packet's pts.
-        int64_t pkt_pts_ms = 0;
-        if (pkt->pts != AV_NOPTS_VALUE) {
-            pkt_pts_ms = av_rescale_q(
-                pkt->pts, st->time_base, AVRational{1, 1000});
-        }
-        int64_t pkt_dur_ms = 0;
-        if (pkt->duration > 0) {
-            pkt_dur_ms = av_rescale_q(
-                pkt->duration, st->time_base, AVRational{1, 1000});
-        }
-
-        AVSubtitle sub{};
-        int got = 0;
-        const int r = avcodec_decode_subtitle2(
-            codec.get(), &sub, &got, pkt.get());
-        av_packet_unref(pkt.get());
-        if (r < 0) {
-            continue;
-        }
-        if (got != 0) {
-            int64_t start_ms = pkt_pts_ms
-                + static_cast<int64_t>(sub.start_display_time);
-            int64_t end_ms   = pkt_pts_ms
-                + static_cast<int64_t>(sub.end_display_time);
-            if (end_ms <= start_ms) {
-                // end_display_time wasn't populated; fall back to
-                // packet duration, then to a sensible default so the
-                // caption at least flashes on screen.
-                end_ms = start_ms + (pkt_dur_ms > 0 ? pkt_dur_ms : 2000);
-            }
-
-            for (unsigned ri = 0; ri < sub.num_rects; ++ri) {
-                const AVSubtitleRect* rect = sub.rects[ri];
-                if (rect == nullptr || rect->ass == nullptr) {
-                    continue;
-                }
-
-                // `rect->ass` is the event *body*, not a full
-                // "Dialogue: …" line. Format, as produced by
-                // `ff_ass_add_rect`:
-                //   readorder,layer,style,name,marginL,marginR,marginV,effect,text
-                // libass expects
-                //   Dialogue: layer,Start,End,style,name,marginL,marginR,marginV,effect,text
-                // Parse out the body's 8 fields after readorder and
-                // splice the packet-derived Start / End in their
-                // rightful place. (Appending rect->ass verbatim was
-                // the bug that produced "0 events" in the log.)
-                const char* ras = rect->ass;
-                std::size_t len = std::strlen(ras);
-
-                // Skip the readorder field (first comma).
-                std::size_t p = 0;
-                while (p < len && ras[p] != ',') ++p;
-                if (p >= len) continue;
-                ++p; // past the comma
-
-                // Collect the next 7 comma offsets; the 8th field
-                // (text) is whatever remains and may itself contain
-                // commas.
-                std::size_t commas[7];
-                int found = 0;
-                for (std::size_t k = p; k < len && found < 7; ++k) {
-                    if (ras[k] == ',') {
-                        commas[found++] = k;
-                    }
-                }
-                if (found < 7) continue;
-
-                auto slice = [&](std::size_t a, std::size_t b) {
-                    return std::string(ras + a, b - a);
-                };
-                const std::string layer   = slice(p,            commas[0]);
-                const std::string style   = slice(commas[0]+1,  commas[1]);
-                const std::string name    = slice(commas[1]+1,  commas[2]);
-                const std::string marginL = slice(commas[2]+1,  commas[3]);
-                const std::string marginR = slice(commas[3]+1,  commas[4]);
-                const std::string marginV = slice(commas[4]+1,  commas[5]);
-                const std::string effect  = slice(commas[5]+1,  commas[6]);
-                const std::string text(ras + commas[6] + 1, len - commas[6] - 1);
-
-                out.append("Dialogue: ");
-                out.append(layer);
-                out.push_back(',');
-                fmt_ass_time(out, start_ms);
-                out.push_back(',');
-                fmt_ass_time(out, end_ms);
-                out.push_back(',');
-                out.append(style);
-                out.push_back(',');
-                out.append(name);
-                out.push_back(',');
-                out.append(marginL);
-                out.push_back(',');
-                out.append(marginR);
-                out.push_back(',');
-                out.append(marginV);
-                out.push_back(',');
-                out.append(effect);
-                out.push_back(',');
-                out.append(text);
-                if (out.empty() || out.back() != '\n') {
-                    out.push_back('\n');
-                }
-            }
-        }
-        avsubtitle_free(&sub);
-    }
-
-    return out;
+    return subtitle_snapshot(stream_index).ass_text;
 }
 
 bool FFmpegSource::switch_audio_stream_while_stopped(int stream_index) noexcept

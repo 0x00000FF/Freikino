@@ -14,6 +14,7 @@ endif()
 
 add_library(freikino_media STATIC
     src/ffmpeg_source.cpp
+    src/matroska_subs.cpp
     src/probe.cpp
     src/thumbnail_source.cpp
 )

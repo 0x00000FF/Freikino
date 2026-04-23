@@ -6,6 +6,8 @@
 #include "subtitle_overlay.h"
 
 #include <algorithm>
+#include <chrono>
+#include <cmath>
 #include <cstdio>
 
 namespace freikino::app {
@@ -39,6 +41,38 @@ float panel_height_for(std::size_t track_rows)
         + visible * kTrackRowH
         + 8.0f + kFooterH
         + kPadY;
+}
+
+// 8-dot rotating spinner centred on `cx,cy`. Dots fade around the
+// ring and the whole ring rotates by `phase_seconds` at 1.1 Hz, which
+// reads as "working" without pulling attention away from the label.
+// `brush` is borrowed; its opacity is saved and restored so callers
+// don't see lingering side effects.
+void draw_row_spinner(
+    ID2D1DeviceContext* ctx,
+    ID2D1SolidColorBrush* brush,
+    float cx, float cy,
+    double phase_seconds) noexcept
+{
+    constexpr int   kDots   = 8;
+    constexpr float kRadius = 6.5f;
+    constexpr float kDotR   = 1.6f;
+    constexpr double kRevPerSec = 1.1;
+    constexpr double kTau   = 6.283185307179586;
+
+    const float saved = brush->GetOpacity();
+    const double rot  = phase_seconds * kRevPerSec * kTau;
+    for (int i = 0; i < kDots; ++i) {
+        const double a = rot + (kTau * i) / kDots;
+        const float dx = static_cast<float>(std::cos(a)) * kRadius;
+        const float dy = static_cast<float>(std::sin(a)) * kRadius;
+        const float alpha = 0.15f
+            + 0.85f * (static_cast<float>(i) / (kDots - 1));
+        brush->SetOpacity(alpha);
+        D2D1_ELLIPSE e{ { cx + dx, cy + dy }, kDotR, kDotR };
+        ctx->FillEllipse(e, brush);
+    }
+    brush->SetOpacity(saved);
 }
 
 } // namespace
@@ -328,23 +362,37 @@ void SubtitleSetupOverlay::draw(
                 ctx->FillRectangle(marker, brush_accent_.Get());
             }
 
-            // Checkbox-style indicator on the left — filled square for
-            // active, hollow for inactive, muted square for unavailable.
-            D2D1_RECT_F box{};
-            box.left   = row_rect.left + 14.0f;
-            box.right  = box.left + 14.0f;
-            box.top    = (row_rect.top + row_rect.bottom) * 0.5f - 7.0f;
-            box.bottom = box.top + 14.0f;
-            if (!info.available) {
-                ctx->DrawRectangle(box, brush_muted_.Get(), 1.0f);
-            } else if (info.active) {
-                ctx->FillRectangle(box, brush_accent_.Get());
+            // Indicator on the left. Three states:
+            //   loading (async extract in flight, or just-clicked) → spinner
+            //   unavailable                                         → muted box
+            //   active / inactive                                   → filled / hollow box
+            const float box_cx = row_rect.left + 14.0f + 7.0f;
+            const float box_cy = (row_rect.top + row_rect.bottom) * 0.5f;
+            if (info.loading) {
+                using steady = std::chrono::steady_clock;
+                static const steady::time_point kOrigin = steady::now();
+                const double phase_s =
+                    std::chrono::duration<double>(
+                        steady::now() - kOrigin).count();
+                draw_row_spinner(ctx, brush_accent_.Get(),
+                                 box_cx, box_cy, phase_s);
             } else {
-                ctx->DrawRectangle(box, brush_text_.Get(), 1.0f);
+                D2D1_RECT_F box{};
+                box.left   = box_cx - 7.0f;
+                box.right  = box_cx + 7.0f;
+                box.top    = box_cy - 7.0f;
+                box.bottom = box_cy + 7.0f;
+                if (!info.available) {
+                    ctx->DrawRectangle(box, brush_muted_.Get(), 1.0f);
+                } else if (info.active) {
+                    ctx->FillRectangle(box, brush_accent_.Get());
+                } else {
+                    ctx->DrawRectangle(box, brush_text_.Get(), 1.0f);
+                }
             }
 
             D2D1_RECT_F label_rect = row_rect;
-            label_rect.left  = box.right + 10.0f;
+            label_rect.left  = box_cx + 7.0f + 10.0f;
             label_rect.right = row_rect.right - 12.0f;
             ID2D1SolidColorBrush* br = info.available
                 ? brush_text_.Get() : brush_muted_.Get();

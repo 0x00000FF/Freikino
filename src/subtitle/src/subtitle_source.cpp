@@ -238,6 +238,43 @@ bool looks_like_cp949_masquerading_as_utf8(const std::string& s) noexcept
     return scripts >= 2 && total >= 10;
 }
 
+// Try to decode `in` as Shift-JIS (CP932). Succeeds only when the
+// bytes parse cleanly AND the decoded text contains enough kana to
+// be plausibly Japanese — a pure-CJK-Unified match would also fit
+// CP949 / CP936, so we key on Hiragana/Katakana which are SJIS-
+// specific among the CJK codepages. Used to rescue Japanese files on
+// a non-JP Windows, where CP_ACP is CP949/CP936 and would otherwise
+// mangle them.
+bool try_decode_sjis(const std::string& in, std::string& out) noexcept
+{
+    constexpr UINT kCpSjis = 932;
+    if (in.empty()) return false;
+    const int wlen = ::MultiByteToWideChar(
+        kCpSjis, MB_ERR_INVALID_CHARS,
+        in.data(), static_cast<int>(in.size()),
+        nullptr, 0);
+    if (wlen <= 0) return false;
+    std::wstring wide(static_cast<std::size_t>(wlen), L'\0');
+    if (::MultiByteToWideChar(
+            kCpSjis, MB_ERR_INVALID_CHARS,
+            in.data(), static_cast<int>(in.size()),
+            wide.data(), wlen) <= 0) {
+        return false;
+    }
+    std::size_t kana = 0;
+    for (wchar_t c : wide) {
+        const auto cp = static_cast<std::uint32_t>(c);
+        if ((cp >= 0x3040u && cp <= 0x30FFu)           // Hira + Kata
+            || (cp >= 0xFF65u && cp <= 0xFF9Fu)) {     // Halfwidth Kata
+            ++kana;
+            if (kana >= 5) break;
+        }
+    }
+    if (kana < 5) return false;
+    out = wide_to_utf8_str(wide.data(), wlen);
+    return !out.empty();
+}
+
 // Decode `bytes` in-place from the named codepage into UTF-8. Returns
 // true on success. Used by the manual encoding override path.
 bool decode_with_codepage(std::string& bytes, UINT codepage) noexcept
@@ -293,6 +330,11 @@ EncodingSpec resolve_encoding(const std::string& name) noexcept
     }
     if (s == "utf16be") {
         out.kind = EncodingSpec::Kind::Utf16Be;
+        return out;
+    }
+    if (s == "sjis" || s == "shiftjis") {
+        out.kind     = EncodingSpec::Kind::Codepage;
+        out.codepage = 932;
         return out;
     }
     // "cp949" / "cp932" / "cp936" / "cp1252" / ... or bare "949" etc.
@@ -367,6 +409,17 @@ const char* normalize_to_utf8(std::string& bytes) noexcept
     const bool structural_utf8 = is_valid_utf8(bytes);
     if (structural_utf8 && !looks_like_cp949_masquerading_as_utf8(bytes)) {
         return "utf-8";
+    }
+    // Japanese-specific rescue before CP_ACP: SJIS bytes rarely form
+    // a valid UTF-8 sequence, so files authored in Japan otherwise land
+    // in the CP_ACP branch and get decoded as CP949/CP936 garbage on
+    // Korean / Chinese Windows.
+    {
+        std::string sjis_decoded;
+        if (try_decode_sjis(bytes, sjis_decoded)) {
+            bytes = std::move(sjis_decoded);
+            return "shift-jis(heur)";
+        }
     }
     // Try the system ANSI code page. MB_ERR_INVALID_CHARS makes the
     // call fail cleanly on bytes that aren't a valid sequence in
@@ -1477,6 +1530,20 @@ void SubtitleSource::add_font(
         // libass keeps the pointer; the caller guarantees lifetime.
         reinterpret_cast<char*>(const_cast<std::uint8_t*>(data)),
         size);
+}
+
+bool SubtitleSource::append_ass_data(std::string_view chunk) noexcept
+{
+    if (s_ == nullptr || s_->track == nullptr || chunk.empty()) {
+        return false;
+    }
+    // ass_process_data takes char* (legacy API) but only reads the
+    // bytes; the const_cast is the standard libass usage pattern.
+    ass_process_data(
+        s_->track,
+        const_cast<char*>(chunk.data()),
+        static_cast<int>(chunk.size()));
+    return true;
 }
 
 } // namespace freikino::subtitle
